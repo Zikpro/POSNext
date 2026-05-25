@@ -30,6 +30,8 @@ export function useInvoice() {
 	const couponCode = ref(null)
 	const taxRules = ref([]) // Tax rules from POS Profile
 	const taxInclusive = ref(false) // Tax inclusive setting from POS Settings
+	const redeemLoyaltyPoints = ref(0)
+	const loyaltyPoints = ref(0)
 
 	// Submission state - prevents duplicate submissions
 	const isSubmitting = ref(false)
@@ -958,6 +960,8 @@ export function useInvoice() {
 			coupon_code: couponCode.value,
 			is_pos: 1,
 			update_stock: 1,
+			redeem_loyalty_points: redeemLoyaltyPoints.value || 0,
+			loyalty_points: loyaltyPoints.value || 0,
 		}
 
 		if (targetDoctype === "Sales Order") {
@@ -1023,6 +1027,8 @@ export function useInvoice() {
 					coupon_code: couponCode.value,
 					is_pos: 1,
 					update_stock: 1, // Critical: Ensures stock is updated
+					redeem_loyalty_points: redeemLoyaltyPoints.value || 0,
+					loyalty_points: loyaltyPoints.value || 0,
 				}
 
 				if (targetDoctype === "Sales Order" && deliveryDate) {
@@ -1185,6 +1191,8 @@ export function useInvoice() {
 		payments.value = []
 		additionalDiscount.value = 0
 		couponCode.value = null
+		redeemLoyaltyPoints.value = 0
+		loyaltyPoints.value = 0
 
 		// Reset incremental cache
 		_cachedSubtotal.value = 0
@@ -1212,6 +1220,8 @@ export function useInvoice() {
 		payments.value = []
 		additionalDiscount.value = 0
 		couponCode.value = null
+		redeemLoyaltyPoints.value = 0
+		loyaltyPoints.value = 0
 
 		// Reset incremental cache
 		_cachedSubtotal.value = 0
@@ -1290,6 +1300,8 @@ export function useInvoice() {
 		taxRules,
 		taxInclusive,
 		isSubmitting,
+		redeemLoyaltyPoints,
+		loyaltyPoints,
 
 		// Computed
 		subtotal,

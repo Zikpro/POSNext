@@ -436,7 +436,8 @@ def get_wallet_info(customer, company, pos_profile=None):
 		"wallet_name": None,
 		"auto_create": False,
 		"loyalty_program": None,
-		"loyalty_to_wallet": False
+		"loyalty_to_wallet": False,
+  		"conversion_factor": 1.0
 	}
 
 	# Check if loyalty program is enabled in POS Settings
@@ -448,6 +449,9 @@ def get_wallet_info(customer, company, pos_profile=None):
 			result["auto_create"] = cint(pos_settings.get("auto_create_wallet"))
 			result["loyalty_program"] = pos_settings.get("default_loyalty_program")
 			result["loyalty_to_wallet"] = cint(pos_settings.get("loyalty_to_wallet"))
+			if result["loyalty_program"]:
+				result["conversion_factor"] = flt(frappe.db.get_value("Loyalty Program", result["loyalty_program"], "conversion_factor")) or 1.0
+
 
 	if not result["wallet_enabled"]:
 		return result
@@ -463,7 +467,16 @@ def get_wallet_info(customer, company, pos_profile=None):
 	if wallet:
 		result["wallet_exists"] = True
 		result["wallet_name"] = wallet.name
-		result["wallet_balance"] = get_customer_wallet_balance(customer, company)
+		# result["wallet_balance"] = get_customer_wallet_balance(customer, company)
+		loyalty_points = frappe.db.sql("""
+						SELECT SUM(loyalty_points)
+						FROM `tabLoyalty Point Entry`
+						WHERE customer = %s
+						AND docstatus IN (0,1)
+					""", customer)[0][0] or 0
+
+		result["wallet_balance"] = flt(loyalty_points)
+    
 	elif result["auto_create"]:
 		# Auto-create wallet for customer if enabled
 		try:

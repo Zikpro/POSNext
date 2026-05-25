@@ -94,6 +94,8 @@ export const usePOSCartStore = defineStore("posCart", () => {
 		additionalDiscount,
 		taxInclusive,
 		isSubmitting,
+		redeemLoyaltyPoints,
+		loyaltyPoints,
 		addItem: addItemToInvoice,
 		removeItem,
 		updateItemQuantity: baseUpdateItemQuantity,
@@ -1827,6 +1829,10 @@ export const usePOSCartStore = defineStore("posCart", () => {
 		// Write-off feature
 		writeOffAmount,
 		setWriteOffAmount,
+
+		// Loyalty points feature
+		redeemLoyaltyPoints,
+		loyaltyPoints,
 
 		// Utilities
 		cancelPendingOfferProcessing: () => {

@@ -281,6 +281,22 @@
 							{{ totalAvailableCredit < 0 ? formatCurrency(Math.abs(totalAvailableCredit)) : formatCurrency(remainingAvailableCredit) }}
 						</span>
 					</div>
+					<!-- Wallet / Available Loyalty Points Row -->
+					<div
+						v-if="walletInfo.wallet_enabled"
+						class="rounded-lg border p-2 flex flex-col bg-amber-50 border-amber-200"
+					>
+						<div class="flex items-center justify-between w-full">
+							<div class="flex flex-col text-start">
+								<span class="text-xs font-semibold text-amber-700">
+									{{ __('Available Points') }}
+								</span>
+								<span class="text-base font-bold text-amber-600">
+									{{ Number(walletInfo.wallet_balance || 0) }} Points
+								</span>
+							</div>
+						</div>
+					</div>
 
 					<!-- Invoice Summary -->
 					<div class="bg-white rounded-lg border border-gray-200 overflow-hidden flex flex-col flex-1 min-h-0">
@@ -1185,6 +1201,37 @@ const walletInfo = ref({
 const loadingWallet = ref(false)
 const walletPaymentMethods = ref(new Set()) // Set of mode_of_payment names that are wallet payments
 
+// Loyalty points redemption state
+const redeemLoyaltyPoints = ref(false)
+const loyaltyPointsToRedeem = ref(0)
+
+const loyaltyRedeemedAmount = computed(() => {
+	if (!redeemLoyaltyPoints.value) return 0
+	return roundCurrency(
+		(loyaltyPointsToRedeem.value || 0) * (walletInfo.value.conversion_factor || 1.0)
+	)
+})
+
+function cancelLoyaltyRedemption() {
+	redeemLoyaltyPoints.value = false
+	loyaltyPointsToRedeem.value = 0
+}
+
+function onLoyaltyPointsInput(event) {
+	let val = Number(event.target.value) || 0
+	const maxPoints = Number(walletInfo.value.wallet_balance || 0)
+	if (val < 0) val = 0
+	if (val > maxPoints) val = maxPoints
+
+	// Also limit points to not exceed the grand total value
+	const conversionRate = Number(walletInfo.value.conversion_factor || 1.0)
+	const maxPointsForTotal = Math.ceil(props.grandTotal / conversionRate)
+	if (val > maxPointsForTotal) {
+		val = maxPointsForTotal
+	}
+
+	loyaltyPointsToRedeem.value = val
+}
 // Delivery date for Sales Orders
 const deliveryDate = ref("")
 const today = new Date().toISOString().split("T")[0]
@@ -1458,9 +1505,15 @@ function isCashPaymentMethod(method) {
 const availableWalletBalance = computed(() => {
 	const totalWalletPayments = paymentEntries.value
 		.filter((p) => isWalletPaymentMethod(p.mode_of_payment))
-		.reduce((sum, p) => sum + (p.amount || 0), 0)
-	return Math.max(0, walletInfo.value.wallet_balance - totalWalletPayments)
+		.reduce((sum, p) => sum + Number(p.amount || 0), 0)
+	return Number(
+		Math.max(
+			0,
+			Number(walletInfo.value.wallet_balance || 0) - totalWalletPayments
+		)
+	)
 })
+
 
 // Filter payment methods - hide wallet methods when loyalty is not enabled
 const filteredPaymentMethods = computed(() => {
@@ -1628,7 +1681,11 @@ async function refreshSalesPersons() {
 function onSalesPersonFocus() {
 	salesPersonDropdownOpen.value = true
 	// If list is empty and not loading, re-fetch as a safety net
-	if (salesPersons.value.length === 0 && !loadingSalesPersons.value && props.posProfile) {
+	if (
+		salesPersons.value.length === 0 &&
+		!loadingSalesPersons.value &&
+		props.posProfile
+	) {
 		refreshSalesPersons()
 	}
 }
@@ -1724,6 +1781,26 @@ const remainingAvailableCredit = computed(() => {
 	return remaining > 0 ? roundCurrency(remaining) : 0
 })
 
+// Wallet payment method
+const walletMethod = computed(() => {
+	return paymentMethods.value.find((m) =>
+		isWalletPaymentMethod(m.mode_of_payment),
+	)
+})
+watch(walletMethod, (val) => {
+	console.log("walletMethod", val)
+})
+
+watch(walletInfo, (val) => {
+	console.log("walletInfo", val)
+}, { deep: true })
+
+watch(paymentMethods, (val) => {
+	console.log("paymentMethods", val)
+}, { deep: true })
+
+console.log("walletPaymentMethods", walletPaymentMethods.value)
+
 // Calculate the actual discount amount based on type (percentage or fixed amount)
 const calculatedAdditionalDiscount = computed(() => {
 	if (additionalDiscountType.value === "percentage") {
@@ -1733,12 +1810,12 @@ const calculatedAdditionalDiscount = computed(() => {
 })
 
 const remainingAmount = computed(() => {
-	const remaining = roundCurrency(props.grandTotal) - totalPaid.value
+	const remaining = roundCurrency(props.grandTotal) - totalPaid.value - loyaltyRedeemedAmount.value
 	return remaining > 0 ? roundCurrency(remaining) : 0
 })
 
 const changeAmount = computed(() => {
-	const change = totalPaid.value - roundCurrency(props.grandTotal)
+	const change = totalPaid.value - (roundCurrency(props.grandTotal) - loyaltyRedeemedAmount.value)
 	return change > 0 ? roundCurrency(change) : 0
 })
 
@@ -1994,7 +2071,11 @@ watch(
 		loadPaymentMethods()
 
 		// Fetch sales persons only when: feature is enabled, not already loaded, and not in-flight
-		if (salesPersonsEnabled && salesPersons.value.length === 0 && !loadingSalesPersons.value) {
+		if (
+			salesPersonsEnabled &&
+			salesPersons.value.length === 0 &&
+			!loadingSalesPersons.value
+		) {
 			refreshSalesPersons()
 		}
 	},
@@ -2004,7 +2085,12 @@ watch(
 // Pre-fetch customer balance when customer changes (before dialog opens)
 // This ensures data is available immediately when dialog opens
 watch(
-	() => [props.customer, props.company, props.allowCreditSale, props.allowCustomerCreditPayment],
+	() => [
+		props.customer,
+		props.company,
+		props.allowCreditSale,
+		props.allowCustomerCreditPayment,
+	],
 	([customer, company, allowCreditSale, allowCustomerCreditPayment]) => {
 		const creditEnabled = allowCreditSale || allowCustomerCreditPayment
 		if (creditEnabled && customer && company) {
@@ -2041,6 +2127,8 @@ watch(show, (newVal) => {
 		applyWriteOff.value = false // Reset write-off state
 		// Set default delivery date to today for Sales Orders
 		deliveryDate.value = isSalesOrder.value ? today : ""
+		redeemLoyaltyPoints.value = false
+		loyaltyPointsToRedeem.value = 0
 
 		// Debug logging
 		log.debug("[PaymentDialog] Dialog opened with props:", {
@@ -2060,8 +2148,12 @@ watch(show, (newVal) => {
 		}
 
 		if (creditEnabled) {
-			log.debug("[PaymentDialog] Customer credit/balance refetch triggered, current balance:", customerBalance.value)
+			log.debug(
+				"[PaymentDialog] Customer credit/balance should be pre-loaded, current balance:",
+				customerBalance.value,
+			)
 		}
+
 
 		// Load wallet info if customer is selected
 		if (props.customer && props.company) {
@@ -2138,20 +2230,85 @@ function switchToNextPaymentMethod(partialAmount) {
 
 // Consolidate payment entries: if a row with the same mode already exists,
 // add to it instead of creating a duplicate row.
+// function _upsertPaymentEntry(method, amt) {
+// 	const existing = paymentEntries.value.find(
+// 		(e) => e.mode_of_payment === method.mode_of_payment && !e.is_customer_credit,
+// 	)
+	
+// 	// Check if this is a Redeem Points payment
+// 	const isRedeemPoints = method.mode_of_payment === "Redeem Points"
+	
+// 	if (existing) {
+// 		existing.amount = roundCurrency((existing.amount || 0) + amt)
+// 		// If adding to existing Redeem Points entry, update loyalty points
+// 		if (isRedeemPoints) {
+// 			const conversionRate = Number(walletInfo.value.conversion_factor || 1.0)
+// 			existing.loyalty_points = (existing.loyalty_points || 0) + Math.floor(amt / conversionRate)
+// 		}
+// 	} else {
+// 		const entry = {
+// 			mode_of_payment: method.mode_of_payment,
+// 			amount: roundCurrency(amt),
+// 			type: method.type || __("Cash"),
+// 			is_wallet_payment: isWalletPaymentMethod(method.mode_of_payment),
+// 		}
+		
+// 		// Add loyalty points metadata for Redeem Points payment
+// 		if (isRedeemPoints) {
+// 			const conversionRate = Number(walletInfo.value.conversion_factor || 1.0)
+// 			entry.loyalty_points = Math.floor(amt / conversionRate)
+// 			entry.redeem_loyalty_points = true
+// 		}
+		
+// 		paymentEntries.value.push(entry)
+// 	}
+// }
+
 function _upsertPaymentEntry(method, amt) {
-	const existing = paymentEntries.value.find(
-		(e) => e.mode_of_payment === method.mode_of_payment && !e.is_customer_credit,
+
+// HANDLE REDEEM POINTS SEPARATELY
+if (method.mode_of_payment === "Redeem Points") {
+
+	redeemLoyaltyPoints.value = true
+
+	const conversionRate = Number(
+		walletInfo.value.conversion_factor || 1.0
 	)
-	if (existing) {
-		existing.amount = roundCurrency((existing.amount || 0) + amt)
-	} else {
-		paymentEntries.value.push({
-			mode_of_payment: method.mode_of_payment,
-			amount: roundCurrency(amt),
-			type: method.type || __("Cash"),
-			is_wallet_payment: isWalletPaymentMethod(method.mode_of_payment),
-		})
-	}
+
+	loyaltyPointsToRedeem.value += Math.floor(
+		amt / conversionRate
+	)
+
+	log.debug(
+		"[PaymentDialog] Loyalty points redeemed:",
+		loyaltyPointsToRedeem.value
+	)
+
+	// DO NOT ADD TO paymentEntries
+	return
+}
+
+// NORMAL PAYMENT FLOW
+const existing = paymentEntries.value.find(
+	(e) =>
+		e.mode_of_payment === method.mode_of_payment &&
+		!e.is_customer_credit,
+)
+
+if (existing) {
+	existing.amount = roundCurrency(
+		(existing.amount || 0) + amt
+	)
+} else {
+	paymentEntries.value.push({
+		mode_of_payment: method.mode_of_payment,
+		amount: roundCurrency(amt),
+		type: method.type || __("Cash"),
+		is_wallet_payment: isWalletPaymentMethod(
+			method.mode_of_payment
+		),
+	})
+}
 }
 
 // Quick add payment (long press action)
@@ -2415,6 +2572,14 @@ function applyCustomerCredit() {
 		paymentEntries.value,
 	)
 }
+// Redeem available wallet/loyalty points
+function redeemWalletPoints() {
+	redeemLoyaltyPoints.value = true
+	const conversionRate = Number(walletInfo.value.conversion_factor || 1.0)
+	const maxPoints = Number(walletInfo.value.wallet_balance || 0)
+	const pointsNeeded = Math.ceil(remainingAmount.value / conversionRate)
+	loyaltyPointsToRedeem.value = Math.min(maxPoints, pointsNeeded)
+}
 
 // Add "Pay on Account" - Credit Sale (invoice with outstanding amount)
 function addCreditAccountPayment() {
@@ -2432,7 +2597,9 @@ function addCreditAccountPayment() {
 		is_partial_payment: false,
 		is_credit_sale: true, // Mark as credit sale
 		paid_amount: 0,
-		outstanding_amount: props.grandTotal,
+		outstanding_amount: props.grandTotal - loyaltyRedeemedAmount.value,
+		redeem_loyalty_points: redeemLoyaltyPoints.value ? 1 : 0,
+		loyalty_points: loyaltyPointsToRedeem.value,
 	}
 
 	log.debug(
@@ -2469,7 +2636,7 @@ function completePayment() {
 	}
 
 	// Calculate if this is a partial payment (considering write-off)
-	const effectivePaid = totalPaid.value + writeOffAmount.value
+	const effectivePaid = totalPaid.value + writeOffAmount.value + loyaltyRedeemedAmount.value
 	const isPartial = effectivePaid < props.grandTotal
 
 	const paymentData = {
@@ -2486,12 +2653,14 @@ function completePayment() {
 		// Write-off data
 		write_off_amount: writeOffAmount.value,
 		is_write_off: writeOffAmount.value > 0,
+		// Loyalty points data - set automatically based on Redeem Points entries
+		redeem_loyalty_points: redeemLoyaltyPoints.value ? 1 : 0,
+		loyalty_points: loyaltyPointsToRedeem.value,
 	}
 
 	log.debug("[PaymentDialog] Emitting payment-completed:", paymentData)
 
 	emit("payment-completed", paymentData)
-
 	show.value = false
 }
 

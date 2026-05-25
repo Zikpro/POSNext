@@ -2036,6 +2036,11 @@ async function handlePaymentCompleted(paymentData) {
 			cartStore.setWriteOffAmount(paymentData.write_off_amount);
 		}
 
+		// Set loyalty point redemption parameters
+		cartStore.redeemLoyaltyPoints = paymentData.redeem_loyalty_points || 0;
+		cartStore.loyaltyPoints = paymentData.loyalty_points || 0;
+
+
 		// Delete draft if it exists (since we're submitting/saving invoice)
 		const draftIdToDelete = cartStore.currentDraftId;
 
@@ -2059,6 +2064,8 @@ async function handlePaymentCompleted(paymentData) {
 				write_off_amount: paymentData.write_off_amount || 0,
 				change_amount: paymentData.change_amount || 0,
 				edited_from: editingOfflineContext?.originalOfflineId || null,
+				redeem_loyalty_points: paymentData.redeem_loyalty_points || 0,
+				loyalty_points: paymentData.loyalty_points || 0,
 			};
 
 			// Save to the offline queue first so we can use the worker's

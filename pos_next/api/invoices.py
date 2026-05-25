@@ -1304,6 +1304,34 @@ def submit_invoice(invoice=None, data=None):
         else:
             invoice_doc = frappe.get_doc(doctype, invoice_name)
             invoice_doc.update(invoice)
+            
+        # =========================
+        # FORCE COST CENTER
+        # =========================
+
+        default_cost_center = frappe.db.get_value(
+            "Company",
+            invoice_doc.company,
+            "cost_center"
+        ) or "Main - ZP"
+
+        # Invoice level
+        if not invoice_doc.get("cost_center"):
+            invoice_doc.cost_center = default_cost_center
+
+        # Items
+        for item in invoice_doc.get("items", []):
+            if not item.get("cost_center"):
+                item.cost_center = default_cost_center
+
+        # Taxes
+        for tax in invoice_doc.get("taxes", []):
+            if hasattr(tax, "cost_center") and not tax.get("cost_center"):
+                tax.cost_center = default_cost_center
+
+        # Write off
+        if invoice_doc.get("write_off_account") and not invoice_doc.get("write_off_cost_center"):
+            invoice_doc.write_off_cost_center = default_cost_center
 
         # Keep permission bypass consistent for POS API flow.
         invoice_doc.flags.ignore_permissions = True
