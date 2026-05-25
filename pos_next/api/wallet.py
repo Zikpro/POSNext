@@ -1,6 +1,8 @@
 # Copyright (c) 2024, BrainWise and contributors
 # For license information, please see license.txt
-
+from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
+	get_loyalty_program_details_with_points
+)
 """
 Wallet API for POS Next
 Handles wallet payments, validation, and loyalty points conversion
@@ -468,14 +470,23 @@ def get_wallet_info(customer, company, pos_profile=None):
 		result["wallet_exists"] = True
 		result["wallet_name"] = wallet.name
 		# result["wallet_balance"] = get_customer_wallet_balance(customer, company)
-		loyalty_points = frappe.db.sql("""
-						SELECT SUM(loyalty_points)
-						FROM `tabLoyalty Point Entry`
-						WHERE customer = %s
-						AND docstatus IN (0,1)
-					""", customer)[0][0] or 0
+		loyalty_program = frappe.db.get_value(
+			"Customer",
+			customer,
+			"loyalty_program"
+		)
 
-		result["wallet_balance"] = flt(loyalty_points)
+		if loyalty_program:
+			loyalty_details = get_loyalty_program_details_with_points(
+				customer=customer,
+				loyalty_program=loyalty_program,
+				company=company,
+				silent=True,
+			)
+
+			result["wallet_balance"] = flt(
+				loyalty_details.get("loyalty_points", 0)
+			) * result["conversion_factor"]
     
 	elif result["auto_create"]:
 		# Auto-create wallet for customer if enabled
