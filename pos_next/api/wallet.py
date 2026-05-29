@@ -484,9 +484,9 @@ def get_wallet_info(customer, company, pos_profile=None):
 				silent=True,
 			)
 
-			result["wallet_balance"] = flt(
-				loyalty_details.get("loyalty_points", 0)
-			) * result["conversion_factor"]
+		result["wallet_balance"] = flt(
+			loyalty_details.get("loyalty_points", 0)
+		)
     
 	elif result["auto_create"]:
 		# Auto-create wallet for customer if enabled
