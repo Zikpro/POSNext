@@ -1795,6 +1795,8 @@ watch(paymentMethods, (val) => {
 }, { deep: true })
 
 console.log("walletPaymentMethods", walletPaymentMethods.value)
+console.log("test", walletInfo.wallet_balance)
+
 
 // Calculate the actual discount amount based on type (percentage or fixed amount)
 const calculatedAdditionalDiscount = computed(() => {
