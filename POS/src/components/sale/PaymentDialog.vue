@@ -281,23 +281,33 @@
 							{{ totalAvailableCredit < 0 ? formatCurrency(Math.abs(totalAvailableCredit)) : formatCurrency(remainingAvailableCredit) }}
 						</span>
 					</div>
-					<!-- Wallet / Available Loyalty Points Row -->
+					<!-- Wallet / Loyalty Summary -->
 					<div
 						v-if="walletInfo.wallet_enabled"
-						class="rounded-lg border p-2 flex flex-col bg-amber-50 border-amber-200"
+						class="grid grid-cols-2 rounded-lg overflow-hidden border border-amber-200"
 					>
-						<div class="flex items-center justify-between w-full">
-							<div class="flex flex-col text-start">
-								<span class="text-xs font-semibold text-amber-700">
-									{{ __('Available Points') }}
-								</span>
-								<span class="text-base font-bold text-amber-600">
-									{{ Number(walletInfo.wallet_balance || 0) }} Points
-								</span>
+						<!-- Available Points -->
+						<div class="bg-amber-50 text-center py-3 px-2">
+							<div class="text-[11px] uppercase font-semibold text-amber-700">
+								{{ __('Available Points') }}
+							</div>
+
+							<div class="text-lg font-bold text-amber-600">
+								{{ Number(walletInfo.wallet_balance || 0) }}
+							</div>
+						</div>
+
+						<!-- Redeemable Amount -->
+						<div class="bg-emerald-50 text-center py-3 px-2 border-l border-emerald-200">
+							<div class="text-[11px] uppercase font-semibold text-emerald-700">
+								{{ __('Redeemable Amount') }}
+							</div>
+
+							<div class="text-lg font-bold text-emerald-600">
+								{{ formatCurrency(walletAmount) }}
 							</div>
 						</div>
 					</div>
-
 					<!-- Invoice Summary -->
 					<div class="bg-white rounded-lg border border-gray-200 overflow-hidden flex flex-col flex-1 min-h-0">
 						<!-- Header -->
@@ -1212,26 +1222,6 @@ const loyaltyRedeemedAmount = computed(() => {
 	)
 })
 
-function cancelLoyaltyRedemption() {
-	redeemLoyaltyPoints.value = false
-	loyaltyPointsToRedeem.value = 0
-}
-
-function onLoyaltyPointsInput(event) {
-	let val = Number(event.target.value) || 0
-	const maxPoints = Number(walletInfo.value.wallet_balance || 0)
-	if (val < 0) val = 0
-	if (val > maxPoints) val = maxPoints
-
-	// Also limit points to not exceed the grand total value
-	const conversionRate = Number(walletInfo.value.conversion_factor || 1.0)
-	const maxPointsForTotal = Math.ceil(props.grandTotal / conversionRate)
-	if (val > maxPointsForTotal) {
-		val = maxPointsForTotal
-	}
-
-	loyaltyPointsToRedeem.value = val
-}
 // Delivery date for Sales Orders
 const deliveryDate = ref("")
 const today = new Date().toISOString().split("T")[0]
@@ -1255,7 +1245,12 @@ const {
 	mobileButtonSize,
 	dynamicNumpadSize,
 } = useResponsivePayment()
-
+const walletAmount = computed(() => {
+	return (
+		Number(walletInfo.value?.wallet_balance || 0) *
+		Number(walletInfo.value?.conversion_factor || 0)
+	)
+})
 // Calculate and sync column heights when dialog opens
 function syncColumnHeights() {
 	nextTick(() => {
@@ -2265,20 +2260,22 @@ function switchToNextPaymentMethod(partialAmount) {
 // }
 
 function _upsertPaymentEntry(method, amt) {
+	console.log("UPSERT CALLED", {
+		method,
+		amt
+	})
 
 // HANDLE REDEEM POINTS SEPARATELY
 if (method.mode_of_payment === "Redeem Points") {
+			console.log("REDEEM BLOCK HIT")
 
 	redeemLoyaltyPoints.value = true
+	const conversionFactor =
+		Number(walletInfo.value.conversion_factor || 1)
 
-	const conversionRate = Number(
-		walletInfo.value.conversion_factor || 1.0
+	loyaltyPointsToRedeem.value = Math.floor(
+		amt / conversionFactor
 	)
-
-	loyaltyPointsToRedeem.value += Math.floor(
-		amt / conversionRate
-	)
-
 	log.debug(
 		"[PaymentDialog] Loyalty points redeemed:",
 		loyaltyPointsToRedeem.value
@@ -2571,14 +2568,6 @@ function applyCustomerCredit() {
 		"[PaymentDialog] Existing credit applied, new entries:",
 		paymentEntries.value,
 	)
-}
-// Redeem available wallet/loyalty points
-function redeemWalletPoints() {
-	redeemLoyaltyPoints.value = true
-	const conversionRate = Number(walletInfo.value.conversion_factor || 1.0)
-	const maxPoints = Number(walletInfo.value.wallet_balance || 0)
-	const pointsNeeded = Math.ceil(remainingAmount.value / conversionRate)
-	loyaltyPointsToRedeem.value = Math.min(maxPoints, pointsNeeded)
 }
 
 // Add "Pay on Account" - Credit Sale (invoice with outstanding amount)
