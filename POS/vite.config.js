@@ -43,10 +43,41 @@ function posNextBuildVersionPlugin(version) {
 	}
 }
 
+/**
+ * Vite plugin — injects the Frappe web_include_js Jinja block into the built HTML.
+ *
+ * Why this exists:
+ *   Frappe populates `context.web_include_js` from every installed app's hooks.py
+ *   `web_include_js` entries. For that list to appear in pos.html, a Jinja loop
+ *   must be present in the file. Since pos.html is regenerated on every `yarn build`
+ *   (buildConfig copies the Vite output to www/pos.html), the only way to add a
+ *   permanent Jinja block is to inject it here — the same technique frappe-ui's
+ *   jinjaBootData plugin uses for the boot block.
+ *
+ * This plugin is generic: any Frappe app that registers files under web_include_js
+ * in its hooks.py will have those scripts loaded on this page automatically.
+ */
+function frappeWebIncludeJsPlugin() {
+	return {
+		name: "frappe-web-include-js",
+		apply: "build",
+		transformIndexHtml(html) {
+			return html.replace(
+				/<\/body>/,
+				`          {% for link in web_include_js %}
+          <script src="{{ link }}"></script>
+          {% endfor %}
+          </body>`,
+			)
+		},
+	}
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
 	plugins: [
 		posNextBuildVersionPlugin(buildVersion),
+		frappeWebIncludeJsPlugin(),
 		frappeui({
 			frappeProxy: true,
 			jinjaBootData: true,

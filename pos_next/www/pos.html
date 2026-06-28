@@ -14,36 +14,22 @@
   <meta name="apple-mobile-web-app-title" content="POSNext" />
   <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%234F46E5' d='M20 7h-4V4c0-1.1-.9-2-2-2h-4c-1.1 0-2 .9-2 2v3H4c-1.1 0-2 .9-2 2v11c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V9c0-1.1-.9-2-2-2zM10 4h4v3h-4V4zm10 16H4V9h16v11z'/></svg>" />
   <title>POSNext</title>
-  <script type="module" crossorigin src="/assets/pos_next/pos/assets/index-P1m6_Okj.js"></script>
+  <script type="module" crossorigin src="/assets/pos_next/pos/assets/index-PY5Q6L7n.js"></script>
   <link rel="stylesheet" crossorigin href="/assets/pos_next/pos/assets/index-mOjqQUpT.css">
 <link rel="manifest" href="/assets/pos_next/pos/manifest.webmanifest"></head>
 
 <body>
   <div id="app"></div>
-
+          {% for link in web_include_js %}
+          <script src="{{ link }}"></script>
+          {% endfor %}
+          
           <script>
               {% for key in boot %}
               window["{{ key }}"] = {{ boot[key] | tojson }};
               {% endfor %}
           </script>
-
-          <script>
-              // Load scripts injected via extend_bootinfo by zp_avery_weigtscale.
-              // This block survives Vite rebuilds because it contains no module references.
-              (function () {
-                  var scripts = window.scale_scripts;
-                  if (!scripts || !scripts.length) return;
-                  function loadNext(i) {
-                      if (i >= scripts.length) return;
-                      var s = document.createElement("script");
-                      s.src = scripts[i];
-                      s.onload = function () { loadNext(i + 1); };
-                      document.head.appendChild(s);
-                  }
-                  loadNext(0);
-              })();
-          </script>
           </body>
-
+          
 
 </html>
