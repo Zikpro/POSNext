@@ -27,9 +27,22 @@
               {% endfor %}
           </script>
 
-          {% for link in web_include_js %}
-          <script src="{{ link }}"></script>
-          {% endfor %}
+          <script>
+              // Load scripts injected via extend_bootinfo by zp_avery_weigtscale.
+              // This block survives Vite rebuilds because it contains no module references.
+              (function () {
+                  var scripts = window.scale_scripts;
+                  if (!scripts || !scripts.length) return;
+                  function loadNext(i) {
+                      if (i >= scripts.length) return;
+                      var s = document.createElement("script");
+                      s.src = scripts[i];
+                      s.onload = function () { loadNext(i + 1); };
+                      document.head.appendChild(s);
+                  }
+                  loadNext(0);
+              })();
+          </script>
           </body>
 
 
