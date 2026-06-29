@@ -476,6 +476,7 @@ def get_wallet_info(customer, company, pos_profile=None):
 			"loyalty_program"
 		)
 
+		loyalty_details = frappe._dict()
 		if loyalty_program:
 			loyalty_details = get_loyalty_program_details_with_points(
 				customer=customer,
