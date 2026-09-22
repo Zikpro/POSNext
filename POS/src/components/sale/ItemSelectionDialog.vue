@@ -121,9 +121,9 @@
 									ref="quantityInput"
 									v-model.number="quantity"
 									type="number"
-									min="1"
-									step="1"
-									inputmode="numeric"
+									:min="isKgQuantity ? '0.001' : '1'"
+									:step="isKgQuantity ? '0.001' : '1'"
+									:inputmode="isKgQuantity ? 'decimal' : 'numeric'"
 									class="w-full text-center border-0 text-sm font-semibold focus:outline-none focus:ring-0 bg-transparent [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
 									@blur="validateQuantity"
 									@keydown.enter="confirm"
@@ -301,9 +301,25 @@ const stockWarning = computed(() => {
 })
 
 /**
- * Validates quantity input ensuring it's a valid positive integer
+ * Validates quantity input. Kg items keep decimal precision (e.g. scale
+ * weights); every other UOM is rounded to a valid positive integer.
  */
+// Kg items (weighed on the scale) keep decimal precision; every other UOM
+// keeps the existing whole-number-only behavior exactly as it was.
+const isKgQuantity = computed(() => {
+	return (props.item?.stock_uom || "").trim().toLowerCase() === "kg"
+})
+
 function validateQuantity() {
+	if (isKgQuantity.value) {
+		// Decimal quantities are valid for Kg (e.g. 0.382, 1.250) — only
+		// guard against invalid/zero/negative values, same fallback as below.
+		if (!quantity.value || isNaN(quantity.value) || quantity.value <= 0) {
+			quantity.value = 1
+		}
+		return
+	}
+
 	// Handle invalid, negative, or decimal values
 	if (!quantity.value || isNaN(quantity.value) || quantity.value < 1) {
 		quantity.value = 1

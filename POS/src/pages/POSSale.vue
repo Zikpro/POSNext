@@ -1228,6 +1228,11 @@ onMounted(async () => {
 	};
 	window.addEventListener("resize", handleResize, { passive: true });
 
+	// Scale readings published by WeightService (zp_avery_weigtscale)
+	window.addEventListener("scale:weight", handleScaleWeight);
+	window.addEventListener("scale:disconnected", clearScaleWeight);
+	window.addEventListener("scale:error", clearScaleWeight);
+
 	// Set up real-time stock update listener
 	const cleanup = onStockUpdate(async (stockUpdates) => {
 		// Filter updates to only include items from our warehouse(s)
@@ -1766,6 +1771,9 @@ async function updatePeriodicStockSyncItems(warehouse) {
 onUnmounted(() => {
 	window.removeEventListener("stockSyncComplete", handleStockSyncComplete);
 	window.removeEventListener("stockSyncError", handleStockSyncError);
+	window.removeEventListener("scale:weight", handleScaleWeight);
+	window.removeEventListener("scale:disconnected", clearScaleWeight);
+	window.removeEventListener("scale:error", clearScaleWeight);
 });
 
 // Handlers
@@ -1831,6 +1839,21 @@ async function handleShiftClosed() {
 			uiStore.showOpenShiftDialog = true;
 		}, 500);
 	}
+}
+
+// Latest valid scale reading in kg, or null when the platform is empty, the
+// weight is still moving, or the scale went away. Fed by the "scale:weight"
+// window event that WeightService (zp_avery_weigtscale) already publishes;
+// isValid() is true only when value > 0 AND the reading is stable.
+const lastScaleWeight = ref(null);
+
+function handleScaleWeight(event) {
+	const reading = event.detail;
+	lastScaleWeight.value = reading?.isValid?.() ? reading.value : null;
+}
+
+function clearScaleWeight() {
+	lastScaleWeight.value = null;
 }
 
 function handleItemSelected(item, autoAdd = false) {
@@ -1904,7 +1927,13 @@ function handleItemSelected(item, autoAdd = false) {
 
 	// Add to cart
 	try {
-		cartStore.addItem(item, 1, false, shiftStore.currentProfile);
+		// Single-UOM Kg items are weighed, and this direct-add branch is the only
+		// path they take — the UOM dialog (where the scale normally fills qty)
+		// never opens for them. Use the live scale reading when one is available.
+		const isKgItem = (item.stock_uom || "").trim().toLowerCase() === "kg";
+		const qty = isKgItem && lastScaleWeight.value ? lastScaleWeight.value : 1;
+
+		cartStore.addItem(item, qty, false, shiftStore.currentProfile);
 	} catch (error) {
 		uiStore.showError(
 			__("Insufficient Stock"),
