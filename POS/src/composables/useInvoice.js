@@ -723,6 +723,26 @@ export function useInvoice() {
 			// Gross rate: price minus per-unit discount
 			return roundCurrency(priceListRate - discountAmount / qty)
 		}
+
+		// No discount of any kind → send the unit rate itself. Deriving it from
+		// the already-rounded line amount (amount / qty) is a lossy round-trip on
+		// fractional quantities: it can land a penny under price_list_rate, and
+		// ERPNext records that gap as a discount that was never applied.
+		const pricingRules = item.pricing_rules
+		const hasPricingRule = Array.isArray(pricingRules)
+			? pricingRules.length > 0
+			: Boolean(pricingRules)
+		const hasDiscount =
+			(item.discount_percentage || 0) > 0 || discountAmount > 0 || hasPricingRule
+
+		if (!hasDiscount) {
+			// Mirror the basis recalculateItem() used: a manually edited rate is
+			// the unit price, otherwise the price list rate is.
+			return roundCurrency(
+				item.is_rate_manually_edited === 1 ? item.rate || 0 : priceListRate,
+			)
+		}
+
 		// Net rate: total amount divided by quantity
 		return qty > 0 ? roundCurrency((item.amount || 0) / qty) : item.rate || 0
 	}
