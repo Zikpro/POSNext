@@ -8,7 +8,6 @@ __pycache__
 
 # Build artifacts
 pos_next/public/pos/
-yarn.lock
 package-lock.json
 
 # IDE and editor files
