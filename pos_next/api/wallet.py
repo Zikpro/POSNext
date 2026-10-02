@@ -434,6 +434,7 @@ def get_wallet_info(customer, company, pos_profile=None):
 		"wallet_enabled": False,
 		"wallet_exists": False,
 		"wallet_balance": 0.0,
+		"loyalty_points": 0.0,
 		"wallet_account": None,
 		"wallet_name": None,
 		"auto_create": False,
@@ -469,7 +470,13 @@ def get_wallet_info(customer, company, pos_profile=None):
 	if wallet:
 		result["wallet_exists"] = True
 		result["wallet_name"] = wallet.name
-		# result["wallet_balance"] = get_customer_wallet_balance(customer, company)
+
+		# Spendable balance is the GL balance on the wallet account, in currency.
+		# Points were already converted to currency when they were earned
+		# (see process_loyalty_to_wallet), so no conversion happens here.
+		result["wallet_balance"] = get_customer_wallet_balance(customer, company)
+
+		# Points are reported separately, for display only — never for spending.
 		loyalty_program = frappe.db.get_value(
 			"Customer",
 			customer,
@@ -485,10 +492,10 @@ def get_wallet_info(customer, company, pos_profile=None):
 				silent=True,
 			)
 
-		result["wallet_balance"] = flt(
+		result["loyalty_points"] = flt(
 			loyalty_details.get("loyalty_points", 0)
 		)
-    
+
 	elif result["auto_create"]:
 		# Auto-create wallet for customer if enabled
 		try:

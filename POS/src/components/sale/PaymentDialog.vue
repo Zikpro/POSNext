@@ -293,7 +293,7 @@
 							</div>
 
 							<div class="text-lg font-bold text-amber-600">
-								{{ Number(walletInfo.wallet_balance || 0) }}
+								{{ Number(walletInfo.loyalty_points || 0).toLocaleString() }}
 							</div>
 						</div>
 
@@ -651,8 +651,8 @@
 								<span class="truncate max-w-[80px] lg:max-w-none">{{ __(method.mode_of_payment) }}</span>
 								<!-- Wallet Balance Badge -->
 								<span v-if="isWalletPaymentMethod(method.mode_of_payment) && walletInfo.wallet_enabled"
-									:class="['font-bold rounded', isSmallMobile ? 'text-[8px] px-1 py-0.5' : 'text-[10px] px-1.5 py-0.5', availableWalletBalance > 0 ? 'text-amber-700 bg-amber-100' : 'text-gray-500 bg-gray-200']">
-									{{ formatCurrency(availableWalletBalance) }}
+									:class="['font-bold rounded', isSmallMobile ? 'text-[8px] px-1 py-0.5' : 'text-[10px] px-1.5 py-0.5', remainingWalletBalance > 0 ? 'text-amber-700 bg-amber-100' : 'text-gray-500 bg-gray-200']">
+									{{ formatCurrency(remainingWalletBalance) }}
 								</span>
 								<!-- Payment Amount Badge -->
 								<span v-if="getMethodTotal(method.mode_of_payment) > 0"
@@ -863,7 +863,7 @@
 
 							<!-- Complete Payment Button -->
 							<button
-								v-if="(remainingAmount === 0 || (applyWriteOff && canWriteOff)) && totalPaid > 0"
+								v-if="(remainingAmount === 0 || (applyWriteOff && canWriteOff)) && (totalPaid > 0 || loyaltyRedeemedAmount > 0)"
 								@click="completePayment"
 								:disabled="isSubmitting || !canComplete"
 								:class="[
@@ -1206,6 +1206,7 @@ const walletInfo = ref({
 	wallet_enabled: false,
 	wallet_exists: false,
 	wallet_balance: 0,
+	loyalty_points: 0,
 	wallet_name: null,
 })
 const loadingWallet = ref(false)
@@ -1214,6 +1215,9 @@ const walletPaymentMethods = ref(new Set()) // Set of mode_of_payment names that
 // Loyalty points redemption state
 const redeemLoyaltyPoints = ref(false)
 const loyaltyPointsToRedeem = ref(0)
+// Mode of payment that triggered the redemption, so the placeholder row below
+// uses the real configured name rather than a hardcoded one.
+const loyaltyMethodName = ref("Redeem Points")
 
 const loyaltyRedeemedAmount = computed(() => {
 	if (!redeemLoyaltyPoints.value) return 0
@@ -1245,9 +1249,13 @@ const {
 	mobileButtonSize,
 	dynamicNumpadSize,
 } = useResponsivePayment()
+// Currency value of the customer's loyalty points. Loyalty redemption is
+// settled in points by ERPNext, but every figure shown to the cashier is the
+// currency equivalent, so points are converted here and nowhere else.
+// `wallet_balance` is the GL wallet ledger and is deliberately not used.
 const walletAmount = computed(() => {
 	return (
-		Number(walletInfo.value?.wallet_balance || 0) *
+		Number(walletInfo.value?.loyalty_points || 0) *
 		Number(walletInfo.value?.conversion_factor || 0)
 	)
 })
@@ -1429,6 +1437,7 @@ const walletInfoResource = createResource({
 			wallet_enabled: false,
 			wallet_exists: false,
 			wallet_balance: 0,
+			loyalty_points: 0,
 			wallet_name: null,
 		}
 		loadingWallet.value = false
@@ -1439,6 +1448,7 @@ const walletInfoResource = createResource({
 			wallet_enabled: false,
 			wallet_exists: false,
 			wallet_balance: 0,
+			loyalty_points: 0,
 			wallet_name: null,
 		}
 		loadingWallet.value = false
@@ -1496,16 +1506,22 @@ function isCashPaymentMethod(method) {
 	return name.includes("cash") || name.includes("نقد") || name.includes("نقدي")
 }
 
-// Get available wallet balance for payment (considering already added wallet payments)
+// Redeemable currency still available for a new redemption entry.
+// The pending loyalty redemption is NOT subtracted here: _upsertPaymentEntry
+// replaces loyaltyPointsToRedeem instead of accumulating it, so subtracting it
+// would block the cashier from re-entering an amount after a full redemption.
 const availableWalletBalance = computed(() => {
 	const totalWalletPayments = paymentEntries.value
 		.filter((p) => isWalletPaymentMethod(p.mode_of_payment))
 		.reduce((sum, p) => sum + Number(p.amount || 0), 0)
+	return Number(Math.max(0, walletAmount.value - totalWalletPayments))
+})
+
+// Redeemable currency left once the pending redemption is taken into account.
+// Display only - the clamps use availableWalletBalance.
+const remainingWalletBalance = computed(() => {
 	return Number(
-		Math.max(
-			0,
-			Number(walletInfo.value.wallet_balance || 0) - totalWalletPayments
-		)
+		Math.max(0, availableWalletBalance.value - loyaltyRedeemedAmount.value)
 	)
 })
 
@@ -1795,7 +1811,6 @@ watch(paymentMethods, (val) => {
 }, { deep: true })
 
 console.log("walletPaymentMethods", walletPaymentMethods.value)
-console.log("test", walletInfo.wallet_balance)
 
 
 // Calculate the actual discount amount based on type (percentage or fixed amount)
@@ -1992,6 +2007,13 @@ const isExactAmountValid = computed(() => {
 	return totalPaid.value <= roundCurrency(props.grandTotal)
 })
 
+// A pure loyalty redemption settles the invoice without creating a payment
+// row, so "has the invoice been settled by something?" cannot be answered by
+// paymentEntries/totalPaid alone.
+const hasSettlement = computed(
+	() => paymentEntries.value.length > 0 || loyaltyRedeemedAmount.value > 0,
+)
+
 const canComplete = computed(() => {
 	// Check sales person validation first (mandatory when enabled)
 	if (!isSalesPersonValid.value) {
@@ -2005,16 +2027,19 @@ const canComplete = computed(() => {
 
 	// If partial payment is allowed, can complete with any amount > 0
 	if (props.allowPartialPayment) {
-		return totalPaid.value > 0 && paymentEntries.value.length > 0
+		return (
+			(totalPaid.value > 0 || loyaltyRedeemedAmount.value > 0) &&
+			hasSettlement.value
+		)
 	}
 
 	// If write-off is applied and covers the remaining amount, can complete
 	if (applyWriteOff.value && canWriteOff.value) {
-		return paymentEntries.value.length > 0
+		return hasSettlement.value
 	}
 
 	// Otherwise require full payment
-	return remainingAmount.value === 0 && paymentEntries.value.length > 0
+	return remainingAmount.value === 0 && hasSettlement.value
 })
 
 const paymentButtonText = computed(() => {
@@ -2126,6 +2151,7 @@ watch(show, (newVal) => {
 		deliveryDate.value = isSalesOrder.value ? today : ""
 		redeemLoyaltyPoints.value = false
 		loyaltyPointsToRedeem.value = 0
+		loyaltyMethodName.value = "Redeem Points"
 
 		// Debug logging
 		log.debug("[PaymentDialog] Dialog opened with props:", {
@@ -2163,6 +2189,7 @@ watch(show, (newVal) => {
 				wallet_enabled: false,
 				wallet_exists: false,
 				wallet_balance: 0,
+				loyalty_points: 0,
 				wallet_name: null,
 			}
 		}
@@ -2262,16 +2289,10 @@ function switchToNextPaymentMethod(partialAmount) {
 // }
 
 function _upsertPaymentEntry(method, amt) {
-	console.log("UPSERT CALLED", {
-		method,
-		amt
-	})
-
 // HANDLE REDEEM POINTS SEPARATELY
 if (method.mode_of_payment === "Redeem Points") {
-			console.log("REDEEM BLOCK HIT")
-
 	redeemLoyaltyPoints.value = true
+	loyaltyMethodName.value = method.mode_of_payment
 	const conversionFactor =
 		Number(walletInfo.value.conversion_factor || 1)
 
@@ -2630,8 +2651,23 @@ function completePayment() {
 	const effectivePaid = totalPaid.value + writeOffAmount.value + loyaltyRedeemedAmount.value
 	const isPartial = effectivePaid < props.grandTotal
 
+	// ERPNext requires at least one payment row on a POS invoice, but it also
+	// folds loyalty_amount into paid_amount itself. A row carrying the redeemed
+	// value would therefore be counted twice (verified locally: paid_amount
+	// became 8.98 on a 4.49 invoice). A zero-value row satisfies the
+	// requirement without touching the accounting. Only needed when loyalty is
+	// the sole tender; it is never added to paymentEntries, so the cashier
+	// never sees it.
+	const submittedPayments = [...paymentEntries.value]
+	if (redeemLoyaltyPoints.value && submittedPayments.length === 0) {
+		submittedPayments.push({
+			mode_of_payment: loyaltyMethodName.value,
+			amount: 0,
+		})
+	}
+
 	const paymentData = {
-		payments: paymentEntries.value,
+		payments: submittedPayments,
 		change_amount: changeAmount.value,
 		is_partial_payment: isPartial,
 		paid_amount: totalPaid.value,
