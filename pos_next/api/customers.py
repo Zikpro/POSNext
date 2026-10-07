@@ -72,13 +72,81 @@ def get_customers(search_term="", pos_profile=None, limit=20, modified_since=Non
 		frappe.throw(_("Error fetching customers: {0}").format(str(e)))
 
 
+def _is_leaf_customer_group(name):
+	"""True when the Customer Group exists and is not a group node."""
+	if not name:
+		return False
+	return frappe.db.get_value("Customer Group", name, "is_group") == 0
+
+
+def _territory_exists(name):
+	"""True when the Territory record exists.
+
+	Unlike Customer Group this deliberately allows group nodes: "All
+	Territories" is a group node and is ERPNext's conventional territory for a
+	customer, so restricting to leaves would silently relocate customers.
+	"""
+	if not name:
+		return False
+	return bool(frappe.db.exists("Territory", name))
+
+
+def _resolve_customer_group(customer_group=None):
+	"""Resolve a Customer Group that actually exists on this site.
+
+	Order: the value supplied by the caller, then Selling Settings' default,
+	then the first non-group record in tree order. Nothing is hardcoded, so a
+	site without "Individual" no longer fails with a LinkValidationError.
+	"""
+	candidates = [
+		customer_group,
+		frappe.db.get_single_value("Selling Settings", "customer_group"),
+	]
+	for name in candidates:
+		if _is_leaf_customer_group(name):
+			return name
+
+	# "lft asc" is required. frappe.db.get_value treats a bare column name as
+	# DESCENDING, which returns the LAST group in tree order (e.g. "Government"
+	# instead of "Individual") - verified on this Frappe version.
+	leaf = frappe.db.get_value("Customer Group", {"is_group": 0}, "name", order_by="lft asc")
+	if leaf:
+		return leaf
+
+	frappe.throw(
+		_("No usable Customer Group found. Please create a Customer Group, or set a "
+		  "Default Customer Group in Selling Settings.")
+	)
+
+
+def _resolve_territory(territory=None):
+	"""Resolve a Territory that actually exists on this site.
+
+	Order: the value supplied by the caller, then Selling Settings' default,
+	then "All Territories" when present, then the first record in tree order.
+	Returns None when the site has no Territory at all; Customer.territory is
+	not mandatory, so ERPNext handles that case itself.
+	"""
+	candidates = [
+		territory,
+		frappe.db.get_single_value("Selling Settings", "territory"),
+		"All Territories",
+	]
+	for name in candidates:
+		if _territory_exists(name):
+			return name
+
+	# See the ordering note in _resolve_customer_group().
+	return frappe.db.get_value("Territory", {}, "name", order_by="lft asc") or None
+
+
 @frappe.whitelist()
 def create_customer(
 	customer_name,
 	mobile_no=None,
 	email_id=None,
-	customer_group="Individual",
-	territory="All Territories",
+	customer_group=None,
+	territory=None,
 	company=None,
 	pos_profile=None,
 ):
@@ -89,8 +157,8 @@ def create_customer(
 	    customer_name (str): Customer name (required)
 	    mobile_no (str): Mobile number (optional)
 	    email_id (str): Email address (optional)
-	    customer_group (str): Customer group (default: Individual)
-	    territory (str): Territory (default: All Territories)
+	    customer_group (str): Customer group (optional; resolved from site config when omitted)
+	    territory (str): Territory (optional; resolved from site config when omitted)
 	    company (str): Company (optional, used to auto-assign loyalty program)
 	    pos_profile (str): POS Profile (optional, preferred for context-aware loyalty assignment)
 
@@ -114,8 +182,8 @@ def create_customer(
 			"doctype": "Customer",
 			"customer_name": customer_name,
 			"customer_type": "Individual",
-			"customer_group": customer_group or "Individual",
-			"territory": territory or "All Territories",
+			"customer_group": _resolve_customer_group(customer_group),
+			"territory": _resolve_territory(territory),
 			"mobile_no": mobile_no or "",
 			"email_id": email_id or "",
 			"loyalty_program": loyalty_program,

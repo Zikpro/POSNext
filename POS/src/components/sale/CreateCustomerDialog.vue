@@ -233,8 +233,8 @@ const customerData = ref({
 	customer_name: "",
 	mobile_no: "",
 	email_id: "",
-	customer_group: "Individual",
-	territory: "All Territories",
+	customer_group: "",
+	territory: "",
 })
 
 // =============================================================================
@@ -337,8 +337,10 @@ const createCustomerResource = createResource({
 		customer_name: customerData.value.customer_name,
 		mobile_no: customerData.value.mobile_no || "",
 		email_id: customerData.value.email_id || "",
-		customer_group: customerData.value.customer_group || __("Individual"),
-		territory: customerData.value.territory || __("All Territories"),
+		// Link values are database record names, never translated. Blank is sent
+		// as null so the backend resolves it from the site configuration.
+		customer_group: customerData.value.customer_group || null,
+		territory: customerData.value.territory || null,
 		pos_profile: props.posProfile,
 	}),
 	onSuccess: (data) => {
@@ -359,8 +361,8 @@ const updateCustomerResource = createResource({
 		name: props.customer?.name,
 		fieldname: {
 			customer_name: customerData.value.customer_name,
-			customer_group: customerData.value.customer_group || __("Individual"),
-			territory: customerData.value.territory || __("All Territories"),
+			customer_group: customerData.value.customer_group || null,
+			territory: customerData.value.territory || null,
 			mobile_no: customerData.value.mobile_no || "",
 			email_id: customerData.value.email_id || "",
 		},
@@ -458,8 +460,8 @@ const resetForm = () => {
 		customer_name: "",
 		mobile_no: "",
 		email_id: "",
-		customer_group: "Individual",
-		territory: "All Territories",
+		customer_group: "",
+		territory: "",
 	})
 	selectedCountryCode.value = ""
 	phoneNumber.value = ""
@@ -481,8 +483,8 @@ watch(
 		if (customer?.name) {
 			customerData.value.customer_name = customer.customer_name || ""
 			customerData.value.email_id = customer.email_id || ""
-			customerData.value.customer_group = customer.customer_group || "Individual"
-			customerData.value.territory = customer.territory || "All Territories"
+			customerData.value.customer_group = customer.customer_group || ""
+			customerData.value.territory = customer.territory || ""
 			// Handle mobile_no with country code
 			if (customer.mobile_no) {
 				customerData.value.mobile_no = customer.mobile_no
