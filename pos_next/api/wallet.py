@@ -476,26 +476,6 @@ def get_wallet_info(customer, company, pos_profile=None):
 		# (see process_loyalty_to_wallet), so no conversion happens here.
 		result["wallet_balance"] = get_customer_wallet_balance(customer, company)
 
-		# Points are reported separately, for display only — never for spending.
-		loyalty_program = frappe.db.get_value(
-			"Customer",
-			customer,
-			"loyalty_program"
-		)
-
-		loyalty_details = frappe._dict()
-		if loyalty_program:
-			loyalty_details = get_loyalty_program_details_with_points(
-				customer=customer,
-				loyalty_program=loyalty_program,
-				company=company,
-				silent=True,
-			)
-
-		result["loyalty_points"] = flt(
-			loyalty_details.get("loyalty_points", 0)
-		)
-
 	elif result["auto_create"]:
 		# Auto-create wallet for customer if enabled
 		try:
@@ -509,6 +489,30 @@ def get_wallet_info(customer, company, pos_profile=None):
 				title="Auto-create Wallet Error",
 				message=f"Customer: {customer}, Company: {company}, Error: {str(e)}"
 			)
+
+	# Loyalty points are a separate ledger from the wallet, so they are read
+	# outside the wallet branches above. A customer can hold points without ever
+	# having had a Wallet record created, and previously that returned 0 points
+	# even though ERPNext showed them. Reported for display only - never spent
+	# from here - and no Wallet is created just to read them.
+	loyalty_program = frappe.db.get_value(
+		"Customer",
+		customer,
+		"loyalty_program"
+	)
+
+	loyalty_details = frappe._dict()
+	if loyalty_program:
+		loyalty_details = get_loyalty_program_details_with_points(
+			customer=customer,
+			loyalty_program=loyalty_program,
+			company=company,
+			silent=True,
+		)
+
+	result["loyalty_points"] = flt(
+		loyalty_details.get("loyalty_points", 0)
+	)
 
 	return result
 
