@@ -73,11 +73,34 @@ function frappeWebIncludeJsPlugin() {
 	}
 }
 
+/**
+ * Vite plugin to fix reka-ui DialogOverlay pointer event handler.
+ *
+ * reka-ui 2.9.8 has a bug where DialogOverlay's onPointerdown uses ["left","prevent"]
+ * modifier instead of just ["left"]. The "prevent" modifier is incorrect and causes
+ * left-clicks to close dialogs when they shouldn't.
+ *
+ * This plugin transforms the compiled module to remove the "prevent" modifier,
+ * ensuring the handler only responds to left-click without preventing default behavior.
+ */
+function rekauiPointerdownFixPlugin() {
+	return {
+		name: "reka-ui-pointerdown-fix",
+		apply: "build",
+		transform(code, id) {
+			if (id.includes("reka-ui/dist/Dialog/DialogOverlayImpl")) {
+				return code.replace(/\["left","prevent"\]/g, '["left"]')
+			}
+		},
+	}
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
 	plugins: [
 		posNextBuildVersionPlugin(buildVersion),
 		frappeWebIncludeJsPlugin(),
+		rekauiPointerdownFixPlugin(),
 		frappeui({
 			frappeProxy: true,
 			jinjaBootData: true,
