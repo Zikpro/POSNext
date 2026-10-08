@@ -84,23 +84,23 @@ function frappeWebIncludeJsPlugin() {
  * ensuring the handler only responds to left-click without preventing default behavior.
  */
 function rekauiPointerdownFixPlugin() {
-	let foundAndFixed = false
 	return {
 		name: "reka-ui-pointerdown-fix",
 		apply: "build",
-		transform(code, id) {
-			// Match DialogOverlayImpl.js from reka-ui
-			if (id.includes("reka-ui") && id.includes("DialogOverlay")) {
-				// Check for the pattern with "prevent" modifier
-				if (code.includes('["left","prevent"]')) {
-					const fixed = code.replace(/\["left","prevent"\]/g, '["left"]')
-					if (!foundAndFixed) {
-						console.log(`[reka-ui-pointerdown-fix] ✓ Fixed DialogOverlay in ${id}`)
-						foundAndFixed = true
-					}
-					return fixed
-				}
+		enforce: "post",
+		// Use renderChunk to operate on the FINAL bundled code.
+		// This runs after all transformations and bundling, guaranteeing
+		// the pattern is caught regardless of module path or transform order.
+		renderChunk(code, chunk) {
+			if (code.includes('["left","prevent"]')) {
+				const matches = code.match(/\["left","prevent"\]/g)
+				const fixed = code.replace(/\["left","prevent"\]/g, '["left"]')
+				console.log(
+					`[reka-ui-pointerdown-fix] ✓ Fixed ${matches.length} occurrence(s) in chunk: ${chunk.fileName}`,
+				)
+				return { code: fixed, map: null }
 			}
+			return null
 		},
 	}
 }
