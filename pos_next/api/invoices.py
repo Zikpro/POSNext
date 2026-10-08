@@ -1447,6 +1447,11 @@ def submit_invoice(invoice=None, data=None):
         frappe.flags.ignore_account_permission = True
         invoice_doc.save()
 
+        # Loyalty handling for returns. Applied after save() so the return's own
+        # grand_total is available, and before submit() so the validate pass that
+        # runs during submit sees the final tender and write-off.
+        loyalty_share = _apply_loyalty_share_to_return(invoice_doc, pos_profile)
+
         # Submit invoice
         invoice_doc.submit()
         invoice_submitted = True
@@ -1484,10 +1489,22 @@ def submit_invoice(invoice=None, data=None):
             if add_to_customer_balance and (wallet_reversal_ok or not has_return_against):
                 from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import credit_return_to_wallet
                 try:
-                    credit_return_to_wallet(
-                        return_invoice=invoice_doc.name,
-                        amount=abs(flt(invoice_doc.grand_total))
+                    # The loyalty share returns as points, so exclude it from
+                    # the wallet credit. loyalty_share is 0 for every
+                    # non-loyalty return, leaving those unchanged.
+                    credit_amount = flt(
+                        abs(flt(invoice_doc.grand_total)) - flt(loyalty_share),
+                        invoice_doc.precision("grand_total"),
                     )
+                    # A fully loyalty-settled return owes no money, so there is
+                    # nothing to credit. The call is skipped rather than made
+                    # with 0 - credit_return_to_wallet() would read a falsy
+                    # amount as "not supplied" and credit the full grand_total.
+                    if credit_amount > 0:
+                        credit_return_to_wallet(
+                            return_invoice=invoice_doc.name,
+                            amount=credit_amount
+                        )
                 except Exception as wallet_credit_error:
                     frappe.log_error(
                         title="Wallet Credit on Return Error",
@@ -2106,6 +2123,137 @@ def _build_item_tax_map(taxes: list) -> dict:
     return dict(tax_map)
 
 
+# Mode of Payment that the sale screen uses to trigger loyalty redemption.
+# It is a UI affordance only: loyalty is recorded in Sales Invoice.loyalty_amount
+# and in Loyalty Point Entry rows, never as a Sales Invoice Payment row. Matches
+# the constant the sale path uses (PaymentDialog.vue loyaltyMethodName).
+LOYALTY_MODE_OF_PAYMENT = "Redeem Points"
+
+
+def _loyalty_share_for_return(return_doc):
+    """Currency value of loyalty to restore for THIS return.
+
+    This is DYNAMIC based on what the cashier entered as monetary payment:
+
+        loyalty_to_restore = min(
+            original_loyalty_amount,
+            return_value - monetary_paid
+        )
+
+    The cashier controls the monetary refund, and loyalty fills the remaining gap
+    (capped by the original redeemed loyalty amount).
+
+    Returns 0.0 for any return whose original had no loyalty redemption.
+    """
+    original = frappe.db.get_value(
+        "Sales Invoice",
+        return_doc.return_against,
+        ["name", "loyalty_amount", "grand_total", "redeem_loyalty_points"],
+        as_dict=True,
+    )
+    if not original or not cint(original.redeem_loyalty_points):
+        return 0.0
+
+    original_loyalty = flt(original.loyalty_amount)
+    return_total = abs(flt(return_doc.grand_total))
+    if original_loyalty <= 0 or return_total <= 0:
+        return 0.0
+
+    # Calculate what the cashier actually paid (sum of monetary payment rows)
+    # Loyalty will fill: min(original_loyalty, return_value - monetary_paid)
+    monetary_paid = flt(
+        sum(
+            abs(flt(p.amount))
+            for p in (return_doc.get("payments") or [])
+            if p.mode_of_payment != LOYALTY_MODE_OF_PAYMENT
+        )
+    )
+
+    loyalty_to_restore = min(
+        original_loyalty,
+        max(0.0, return_total - monetary_paid),
+    )
+    return flt(loyalty_to_restore, return_doc.precision("write_off_amount"))
+
+
+def _apply_loyalty_share_to_return(invoice_doc, pos_profile=None):
+    """Make the backend authoritative over the loyalty/money split of a return.
+
+    The loyalty-settled share of a return comes back to the customer as restored
+    loyalty points, not as money. Writing that share off keeps it off Debtors so
+    it cannot also become a cash refund or an artificial customer credit.
+
+    The write-off is NEGATIVE on purpose: make_write_off_gl_entry() credits
+    debit_to, and on a return Debtors already carries the loyalty share as a
+    credit, so a negative write-off debits it back to zero.
+
+    Everything is derived here rather than trusted from the client, so a stale
+    cached bundle or a direct API call cannot produce a wrong refund. Returns the
+    loyalty share actually applied.
+    """
+    if not (invoice_doc.get("is_return") and invoice_doc.get("return_against")):
+        return 0.0
+
+    loyalty_share = _loyalty_share_for_return(invoice_doc)
+
+    # Loyalty is never a payment row. A row against the loyalty mode would post
+    # real money to that mode's account, so drop it whatever the client sent.
+    for row in [
+        p
+        for p in (invoice_doc.get("payments") or [])
+        if p.mode_of_payment == LOYALTY_MODE_OF_PAYMENT
+    ]:
+        invoice_doc.remove(row)
+
+    if not loyalty_share:
+        return 0.0
+
+    currency_precision = invoice_doc.precision("grand_total")
+    conversion_rate = flt(invoice_doc.conversion_rate) or 1.0
+    return_total = abs(flt(invoice_doc.grand_total))
+
+    # Cap the monetary tender at the non-loyalty share. Clamped DOWNWARD only:
+    # a deliberate shortfall on a partially-paid or credit-sale original stays
+    # as outstanding, exactly as before.
+    cap = flt(return_total - loyalty_share, currency_precision)
+    rows = invoice_doc.get("payments") or []
+    tendered = flt(sum(abs(flt(p.amount)) for p in rows), currency_precision)
+
+    if tendered > cap:
+        if cap <= 0:
+            for row in list(rows):
+                invoice_doc.remove(row)
+        else:
+            scale = cap / tendered
+            allocated = 0.0
+            for index, row in enumerate(rows):
+                if index == len(rows) - 1:
+                    scaled = flt(cap - allocated, currency_precision)
+                else:
+                    scaled = flt(abs(flt(row.amount)) * scale, currency_precision)
+                    allocated = flt(allocated + scaled, currency_precision)
+                # Refund rows are negative; keep whatever sign the row carries.
+                row.amount = -scaled if flt(row.amount) < 0 else scaled
+                row.base_amount = flt(flt(row.amount) * conversion_rate, currency_precision)
+
+    # Preserve any pre-existing legitimate write-off by subtracting from it.
+    # Deliberately not subject to POS Profile.write_off_limit - this is an
+    # accounting consequence of the original sale, not a cashier decision.
+    write_off_precision = invoice_doc.precision("write_off_amount")
+    adjusted = flt(flt(invoice_doc.get("write_off_amount")) - loyalty_share, write_off_precision)
+    invoice_doc.write_off_amount = adjusted
+    invoice_doc.base_write_off_amount = flt(adjusted * conversion_rate, write_off_precision)
+    invoice_doc.write_off_account = (
+        invoice_doc.get("write_off_account")
+        or frappe.get_cached_value("Company", invoice_doc.company, "write_off_account")
+        or frappe.db.get_value("POS Profile", pos_profile, "write_off_account")
+    )
+    if not invoice_doc.get("write_off_cost_center"):
+        invoice_doc.write_off_cost_center = invoice_doc.get("cost_center")
+
+    return loyalty_share
+
+
 def _remap_foreign_payment_modes(payments_data, current_profile, original_profile):
     """Remap payment modes that don't belong to the current POS profile.
 
@@ -2279,7 +2427,12 @@ def prepare_return_invoice(invoice_name, pos_opening_shift=None):
             si.customer,
             si.customer_name,
             si.net_total,
-            si.total_taxes_and_charges
+            si.total_taxes_and_charges,
+            # Loyalty: the frontend needs these to show the points/money split
+            # and to seed the monetary tender without the loyalty share.
+            si.loyalty_amount,
+            si.loyalty_points,
+            si.redeem_loyalty_points
         )
         .where(si.name == invoice_name)
     ).run(as_dict=True)
@@ -2400,6 +2553,9 @@ def prepare_return_invoice(invoice_name, pos_opening_shift=None):
         "payments": payments_data,
         "net_total": invoice_info.net_total,
         "total_taxes_and_charges": invoice_info.total_taxes_and_charges,
+        "loyalty_amount": invoice_info.loyalty_amount,
+        "loyalty_points": invoice_info.loyalty_points,
+        "redeem_loyalty_points": invoice_info.redeem_loyalty_points,
     }
 
     item_tax_map = _build_item_tax_map(return_dict.get("taxes", []))

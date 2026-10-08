@@ -549,7 +549,7 @@
 											class="payment-select flex-1 py-2.5 border border-gray-300 rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white appearance-none cursor-pointer hover:border-gray-400 transition-colors ps-3 pe-10"
 										>
 											<option value="">{{ __('Select method...') }}</option>
-											<option v-for="method in paymentMethods" :key="method.mode_of_payment" :value="method.mode_of_payment">
+											<option v-for="method in refundMethods" :key="method.mode_of_payment" :value="method.mode_of_payment">
 												{{ method.mode_of_payment }}
 											</option>
 										</select>
@@ -600,21 +600,41 @@
 
 						<!-- Payment Summary -->
 						<div class="mt-3 p-3 bg-gray-50 rounded-lg border border-gray-200">
-							<div class="flex items-center justify-between text-sm">
-								<span class="text-gray-600">{{ isPartiallyPaid ? __('Refundable Amount:') : __('Total Refund:') }}</span>
-								<span class="font-bold text-gray-900">{{ formatCurrency(isPartiallyPaid ? maxRefundableAmount : returnTotal) }}</span>
+							<!-- Return Value -->
+							<div class="flex items-center justify-between text-sm font-semibold">
+								<span class="text-gray-700">{{ __('Return Value:') }}</span>
+								<span class="text-gray-900">{{ formatCurrency(returnTotal) }}</span>
 							</div>
-							<div class="flex items-center justify-between text-sm mt-1">
-								<span class="text-gray-600">{{ __('Payment Total:') }}</span>
-								<span :class="[
-									'font-bold',
-									Math.abs(totalPaymentAmount - (isPartiallyPaid ? maxRefundableAmount : returnTotal)) < 0.01 ? 'text-green-600' : 'text-red-600'
-								]">
-									{{ formatCurrency(totalPaymentAmount) }}
-								</span>
+
+							<!-- Monetary Refund (Cash/Card entered by cashier) -->
+							<div class="flex items-center justify-between text-sm mt-2">
+								<span class="text-gray-600">{{ __('Monetary Refund:') }}</span>
+								<span class="font-medium text-gray-800">{{ formatCurrency(monetaryTenderedAmount) }}</span>
 							</div>
-							<p v-if="Math.abs(totalPaymentAmount - (isPartiallyPaid ? maxRefundableAmount : returnTotal)) >= 0.01" class="mt-2 text-xs text-amber-600 text-start">
-								{{ isPartiallyPaid ? __('⚠️ Payment total must equal refundable amount') : __('⚠️ Payment total must equal refund amount') }}
+
+							<!-- Loyalty Points Restored (Auto-calculated) -->
+							<div v-if="originalLoyaltyAmount > 0" class="flex items-center justify-between text-sm mt-2 p-2 bg-amber-50 rounded border border-amber-200">
+								<div>
+									<span class="text-amber-900 font-medium">{{ __('Loyalty Points Restored:') }}</span>
+									<span v-if="loyaltyPointsRestored" class="block text-xs text-amber-700">
+										{{ loyaltyPointsRestored }} {{ __('points') }} @ £{{ __('0.01') }}/pt
+									</span>
+								</div>
+								<span class="font-bold text-amber-900">{{ formatCurrency(loyaltyToRestore) }}</span>
+							</div>
+
+							<!-- Total -->
+							<div class="flex items-center justify-between text-sm mt-2 pt-2 border-t border-gray-300 font-semibold">
+								<span class="text-gray-800">{{ __('Total Refund:') }}</span>
+								<span class="text-lg text-gray-900">{{ formatCurrency(monetaryTenderedAmount + loyaltyToRestore) }}</span>
+							</div>
+
+							<!-- Validation message -->
+							<p v-if="monetaryTenderedAmount + loyaltyToRestore > returnTotal + 0.01" class="mt-2 text-xs text-red-600 text-start">
+								{{ __('⚠️ Total exceeds return value') }}
+							</p>
+							<p v-else-if="originalLoyaltyAmount > 0 && loyaltyToRestore > 0" class="mt-2 text-xs text-amber-700 text-start">
+								{{ __('Loyalty points will be automatically restored to the customer. Cash/Card refund is the monetary amount only.') }}
 							</p>
 						</div>
 					</div>
@@ -808,7 +828,21 @@ const originalInvoice = ref(null)
 const preparedReturnDoc = ref(null)
 const returnItems = ref([])
 const returnReason = ref("")
+// The sale screen uses this Mode of Payment to trigger loyalty redemption, but
+// loyalty is recorded in loyalty_amount and Loyalty Point Entry rows - never as a
+// Sales Invoice Payment row. Offering it as a refund mode would post real money to
+// that mode's account, so it is excluded everywhere below. Same constant as the
+// sale path (PaymentDialog.vue loyaltyMethodName) and the backend
+// (LOYALTY_MODE_OF_PAYMENT in pos_next/api/invoices.py).
+const LOYALTY_MODE_OF_PAYMENT = "Redeem Points"
+
 const paymentMethods = ref([])
+/** Profile payment methods, minus loyalty - loyalty is not money. */
+const refundMethods = computed(() =>
+	paymentMethods.value.filter(
+		(method) => method.mode_of_payment !== LOYALTY_MODE_OF_PAYMENT,
+	),
+)
 const refundPayments = ref([])
 const invoiceList = ref([])
 const invoiceListFilter = ref("")
@@ -957,6 +991,12 @@ const fetchInvoiceResource = createResource({
 				paid_amount: origInvoice.paid_amount,
 				outstanding_amount: origInvoice.outstanding_amount,
 				payments: origInvoice.payments || [],
+				// Loyalty figures drive the points/money split shown below and the
+				// seeded tender. Without them the split silently collapses to
+				// "refund everything as money".
+				loyalty_amount: origInvoice.loyalty_amount,
+				loyalty_points: origInvoice.loyalty_points,
+				redeem_loyalty_points: origInvoice.redeem_loyalty_points,
 				docstatus: 1, // Already validated by backend
 				is_return: 0,
 			}
@@ -1067,12 +1107,20 @@ const createReturnResource = createResource({
 			// Payment amounts are negative for refunds
 			// If addToCustomerCredit is true, send empty payments array so outstanding stays negative
 			// This negative outstanding becomes customer credit balance
+			// Loyalty is never a payment row (the backend drops one too, since it
+			// is authoritative over the split).
 			payments: addToCustomerCredit.value
 				? []
-				: refundPayments.value.map((payment) => ({
-						mode_of_payment: payment.mode_of_payment,
-						amount: -Math.abs(payment.amount),
-				  })),
+				: refundPayments.value
+						.filter(
+							(payment) =>
+								payment.mode_of_payment !== LOYALTY_MODE_OF_PAYMENT &&
+								Math.abs(Number(payment.amount) || 0) > 0,
+						)
+						.map((payment) => ({
+							mode_of_payment: payment.mode_of_payment,
+							amount: -Math.abs(payment.amount),
+						})),
 			remarks:
 				returnReason.value ||
 				__("Return against {0}", [originalInvoice.value.name]),
@@ -1216,15 +1264,72 @@ const totalPaymentAmount = computed(() =>
 	),
 )
 
+/**
+ * Value being returned as a fraction of the original invoice.
+ *
+ * A ratio of the two grand totals, on one consistent basis: both already
+ * include discounts and taxes, so it needs no adjustment and carries no
+ * double-count risk. Value rather than quantity, so returning the cheap line
+ * of a mixed-price basket restores only its own share. Mirrors
+ * _loyalty_share_for_return() in pos_next/api/invoices.py, which is
+ * authoritative - this is for display and for seeding the tender.
+ */
+const returnedValueFraction = computed(() => {
+	const originalTotal = Math.abs(
+		Number(originalInvoice.value?.grand_total) || 0,
+	)
+	if (!originalTotal) return 0
+	return Math.min(1, returnTotal.value / originalTotal)
+})
+
+/**
+ * Maximum loyalty that can be restored for this return.
+ * This is the ORIGINAL redeemed loyalty amount from the sale, never reduced.
+ * The actual restoration is capped by the remaining return value after monetary refund.
+ */
+const originalLoyaltyAmount = computed(() => {
+	if (!Number(originalInvoice.value?.redeem_loyalty_points)) return 0
+	return Math.abs(Number(originalInvoice.value?.loyalty_amount) || 0)
+})
+
+/** Loyalty points handed back to the customer for this return. */
+const loyaltyPointsRestored = computed(() => {
+	const points = Math.abs(Number(originalInvoice.value?.loyalty_points) || 0)
+	if (!points || !loyaltyToRestore.value) return 0
+	// Prorate points based on what's actually being restored
+	const ratio = loyaltyToRestore.value / originalLoyaltyAmount.value
+	return Math.round(points * ratio)
+})
+
+/**
+ * Money actually paid on the original, excluding the loyalty-settled share.
+ * paid_amount includes loyalty_amount (core adds it in calculate_paid_amount),
+ * which would otherwise inflate the refundable cap on a partially-paid sale.
+ */
+const originalMonetaryPaid = computed(() => {
+	const loyaltyAmount = Number(originalInvoice.value?.redeem_loyalty_points)
+		? Math.abs(Number(originalInvoice.value?.loyalty_amount) || 0)
+		: 0
+	return Math.max(0, roundCurrency(originalPaidAmount.value - loyaltyAmount))
+})
+
+/** What may actually be refunded as money, once loyalty is excluded. */
+/**
+ * Maximum monetary refund the cashier can enter.
+ * Loyalty fills the remaining gap, but is never more than original_loyalty_amount.
+ * So: monetary can be up to return_value.
+ */
+const refundableTotal = computed(() => returnTotal.value)
+
 const maxRefundableAmount = computed(() => {
 	if (!originalInvoice.value) return 0
 	if (!isPartiallyPaid.value && !isOriginalCreditSale.value)
-		return returnTotal.value
+		return refundableTotal.value
 
 	const grandTotal = Math.abs(originalInvoice.value.grand_total) || 1
 	const returnRatio = returnTotal.value / grandTotal
 	return roundCurrency(
-		Math.min(returnTotal.value, originalPaidAmount.value * returnRatio),
+		Math.min(refundableTotal.value, originalMonetaryPaid.value * returnRatio),
 	)
 })
 
@@ -1258,26 +1363,23 @@ const canCreateReturn = computed(() => {
 	// Credit sale returns and "add to customer credit" returns don't need payment validation
 	if (isOriginalCreditSale.value || addToCustomerCredit.value) return true
 
-	const payments = refundPayments.value
-	if (isPartiallyPaid.value) {
-		if (!payments.length) return true
-		const hasValidPayments = payments.every(
-			(payment) => payment.mode_of_payment && payment.amount >= 0,
-		)
-		return (
-			hasValidPayments &&
-			Math.abs(totalPaymentAmount.value - maxRefundableAmount.value) < 0.01
-		)
-	}
+	// A fully loyalty-settled return has nothing to refund as money.
+	if (refundableTotal.value <= 0) return true
 
-	if (!payments.length) return false
+	// For all other returns: user can enter amounts up to the refundable cap.
+	// Backend enforces the exact split and write-off. Loyalty auto-fills the gap.
+	const payments = refundPayments.value
+	if (!payments.length) return true // Allow submit with zero rows; backend will handle
+
+	// Each payment row must have a valid mode and non-negative amount
 	const hasValidPayments = payments.every(
-		(payment) => payment.mode_of_payment && payment.amount > 0,
+		(payment) => payment.mode_of_payment && Number(payment.amount) >= 0,
 	)
-	return (
-		hasValidPayments &&
-		Math.abs(totalPaymentAmount.value - returnTotal.value) < 0.01
-	)
+	if (!hasValidPayments) return false
+
+	// Total must not exceed the refundable cap (backend also enforces this)
+	const cap = isPartiallyPaid.value ? maxRefundableAmount.value : refundableTotal.value
+	return totalPaymentAmount.value <= cap + 0.01 // allow 1p rounding
 })
 
 // Shared filter function to avoid duplicate code
@@ -1340,16 +1442,13 @@ watch(normalizedSearchTerm, (searchTerm) => {
 	}, SEARCH_DEBOUNCE_MS)
 })
 
-// Auto-populate payment amount when return total changes (single payment only)
-watch(returnTotal, (newTotal) => {
-	if (!returnModal.visible || !showDialog.value || isOriginalCreditSale.value)
-		return
-	if (refundPayments.value.length !== 1 || newTotal <= 0) return
-
-	refundPayments.value[0].amount = isPartiallyPaid.value
-		? roundCurrency(maxRefundableAmount.value)
-		: newTotal
-})
+// When items are selected/changed, re-initialize payment rows based on full/partial status.
+// Full return: seed from original. Partial: start empty for cashier control.
+watch(selectedItems, () => {
+	if (returnModal.visible && originalInvoice.value && paymentMethods.value.length) {
+		initializePaymentsFromInvoice()
+	}
+}, { deep: true })
 
 // Methods
 function extractErrorMessage(
@@ -1423,6 +1522,49 @@ function addPaymentRow() {
 	refundPayments.value.push({ mode_of_payment: "", amount: 0 })
 }
 
+/**
+ * Whether this is a full or partial return.
+ * Full: entire original invoice is being returned.
+ * Partial: only some items/qty are being returned.
+ */
+const isFullReturn = computed(() => {
+	if (!originalInvoice.value) return false
+	const origTotal = Math.abs(Number(originalInvoice.value.grand_total) || 0)
+	return Math.abs(returnTotal.value - origTotal) < 0.01
+})
+
+/**
+ * How much monetary the user has actually entered for refund.
+ */
+const monetaryTenderedAmount = computed(() =>
+	roundCurrency(
+		refundPayments.value.reduce(
+			(sum, row) => sum + Math.abs(Number(row.amount) || 0),
+			0,
+		),
+	),
+)
+
+/**
+ * Loyalty points the customer will actually receive for this return.
+ * Capped by the original redeemed loyalty, and by the remaining return value after monetary refund.
+ *
+ * loyalty_to_restore = min(
+ *   original_loyalty_amount,
+ *   return_value - monetary_tendered
+ * )
+ *
+ * This recalculates dynamically as the cashier changes the monetary payment.
+ */
+const loyaltyToRestore = computed(() => {
+	const cap = Math.min(
+		originalLoyaltyAmount.value,
+		Math.max(0, returnTotal.value - monetaryTenderedAmount.value),
+	)
+	return roundCurrency(cap)
+})
+
+
 function removePaymentRow(paymentIndex) {
 	refundPayments.value.splice(paymentIndex, 1)
 }
@@ -1454,31 +1596,41 @@ function initializePaymentsFromInvoice() {
 		return
 	}
 
-	const defaultMode = paymentMethods.value[0]?.mode_of_payment || ""
+	const defaultMode = refundMethods.value[0]?.mode_of_payment || ""
 
-	const invoicePayments = originalInvoice.value?.payments
-	if (invoicePayments?.length) {
+	// Loyalty was never a real payment row, so any such row on the original is
+	// not money and must not be refunded as money.
+	const invoicePayments = (originalInvoice.value?.payments || []).filter(
+		(payment) => payment.mode_of_payment !== LOYALTY_MODE_OF_PAYMENT,
+	)
+	if (invoicePayments.length) {
 		// Only remap when paymentMethods are loaded. When null (not yet loaded),
 		// the backend has already remapped via _remap_foreign_payment_modes,
 		// so the modes are safe to use as-is.
 		const currentModes = paymentMethods.value.length
-			? new Set(paymentMethods.value.map((m) => m.mode_of_payment))
+			? new Set(refundMethods.value.map((m) => m.mode_of_payment))
 			: null
 
-		refundPayments.value = invoicePayments.map((payment) => ({
-			mode_of_payment:
-				currentModes && !currentModes.has(payment.mode_of_payment)
-					? defaultMode
-					: payment.mode_of_payment,
-			amount: isPartiallyPaid.value ? 0 : Math.abs(payment.amount),
-		}))
+		if (isFullReturn.value) {
+			// FULL return: preserve the original monetary/loyalty split.
+			// Seed payment rows from original monetary amounts.
+			// Loyalty will auto-fill to match the original split.
+			refundPayments.value = invoicePayments.map((payment) => ({
+				mode_of_payment:
+					currentModes && !currentModes.has(payment.mode_of_payment)
+						? defaultMode
+						: payment.mode_of_payment,
+				amount: Math.abs(payment.amount),
+			}))
+		} else {
+			// PARTIAL return: cashier controls monetary amount.
+			// Loyalty automatically fills the remaining eligible portion.
+			// Start with empty rows for cashier to enter amounts.
+			refundPayments.value = []
+		}
 	} else {
-		refundPayments.value = [
-			{
-				mode_of_payment: defaultMode,
-				amount: 0,
-			},
-		]
+		// Fully loyalty-settled original: nothing to refund as money.
+		refundPayments.value = []
 	}
 }
 

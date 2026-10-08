@@ -335,8 +335,11 @@ def credit_return_to_wallet(return_invoice, amount=None):
 	customer = return_data.customer
 	company = return_data.company
 
-	# Determine credit amount: explicit amount or absolute grand_total
-	credit_amount = flt(amount) if amount else abs(flt(return_data.grand_total))
+	# Determine credit amount: explicit amount or absolute grand_total.
+	# Tested against None, not truthiness: an explicit 0 means "nothing to
+	# credit" (a fully loyalty-settled return), and must not fall back to the
+	# full grand_total.
+	credit_amount = flt(amount) if amount is not None else abs(flt(return_data.grand_total))
 
 	if credit_amount <= 0:
 		return None

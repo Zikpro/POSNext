@@ -95,6 +95,261 @@ class CustomSalesInvoice(SalesInvoice):
 	for wallet payment methods marked with is_wallet_payment.
 	"""
 
+	# ------------------------------------------------------------------
+	# Loyalty handling on returns
+	#
+	# ERPNext reverses loyalty on a return by deleting the ORIGINAL invoice's
+	# Loyalty Point Entries and recreating the earned one. Three measured
+	# defects are corrected here, all without touching ERPNext core:
+	#
+	#   1. make_loyalty_point_entry() subtracts the full return grand_total
+	#      from a base that already excludes loyalty_amount, so the loyalty
+	#      share is counted twice and a spurious negative earn row appears
+	#      (measured: -8 on a GBP12 invoice, -40 on a GBP10 one).
+	#   2. The redemption row is deleted in full even on a partial return, so
+	#      the customer gets back 100% of the points for a 50% return.
+	#   3. delete_loyalty_point_entry() throws when the original's earned
+	#      points were later redeemed elsewhere, making such a return
+	#      impossible.
+	#
+	# The returned share is DERIVED as a VALUE RATIO of the two grand totals.
+	# A ratio on one consistent basis carries no double-count risk, and unlike a
+	# quantity ratio it stays correct for mixed-price baskets and discounts.
+	# ------------------------------------------------------------------
+
+	def _pos_next_returned_fraction(self):
+		"""Fraction of this invoice returned so far, by VALUE (0.0 - 1.0).
+
+		Value-based so that returning the cheap line of a mixed-price basket
+		restores only its own share: a quantity ratio would hand back half the
+		loyalty for one of two items regardless of their prices. Both totals
+		already include discounts and taxes, so the ratio needs no adjustment.
+
+		Cumulative across every submitted return, which keeps multiple partial
+		returns correct and makes the callers idempotent.
+		"""
+		original_total = abs(flt(self.grand_total))
+		if not original_total:
+			return 0.0
+
+		returned_total = abs(
+			flt(
+				frappe.db.sql(
+					"""select sum(grand_total) from `tabSales Invoice`
+					   where docstatus = 1 and is_return = 1 and return_against = %s""",
+					self.name,
+				)[0][0]
+				or 0
+			)
+		)
+		return min(1.0, returned_total / original_total)
+
+	def make_loyalty_point_entry(self):
+		"""Recreate the earned entry using a loyalty-aware returned amount.
+
+		Core computes eligible_amount = (grand_total - loyalty_amount) -
+		returned_amount, where returned_amount is the full return grand_total.
+		That subtracts the loyalty share twice. The eligible base is simply the
+		unreturned share of the non-loyalty value.
+		"""
+		# Core's version assumes a programme is set, but the return path calls
+		# this on the ORIGINAL invoice, which may legitimately have none.
+		if not self.loyalty_program:
+			return
+
+		fraction = self._pos_next_returned_fraction()
+		if not fraction:
+			return super().make_loyalty_point_entry()
+
+		from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
+			get_loyalty_program_details_with_points,
+		)
+		from frappe.utils import add_days, getdate
+
+		net_of_loyalty = flt(self.grand_total) - flt(self.loyalty_amount)
+		eligible_amount = net_of_loyalty * (1.0 - fraction)
+
+		lp_details = get_loyalty_program_details_with_points(
+			self.customer,
+			company=self.company,
+			current_transaction_amount=net_of_loyalty,
+			loyalty_program=self.loyalty_program,
+			expiry_date=self.posting_date,
+			include_expired_entry=True,
+		)
+		if not (
+			lp_details
+			and getdate(lp_details.from_date) <= getdate(self.posting_date)
+			and (not lp_details.to_date or getdate(lp_details.to_date) >= getdate(self.posting_date))
+		):
+			return
+
+		collection_factor = lp_details.collection_factor or 1.0
+		points_earned = cint(eligible_amount / collection_factor)
+
+		doc = frappe.get_doc(
+			{
+				"doctype": "Loyalty Point Entry",
+				"company": self.company,
+				"loyalty_program": lp_details.loyalty_program,
+				"loyalty_program_tier": lp_details.tier_name,
+				"customer": self.customer,
+				"invoice_type": self.doctype,
+				"invoice": self.name,
+				"loyalty_points": points_earned,
+				"purchase_amount": eligible_amount,
+				"expiry_date": add_days(self.posting_date, lp_details.expiry_duration),
+				"posting_date": self.posting_date,
+			}
+		)
+		doc.flags.ignore_permissions = 1
+		doc.save()
+		self.set_loyalty_program_tier()
+
+	def delete_loyalty_point_entry(self):
+		"""Allow a return even when the earned points were redeemed elsewhere.
+
+		Core throws in that case. Here the dependent redemption rows are
+		re-pointed at another earn entry with spare capacity (or detached) so
+		the ledger stays consistent. Their amounts are never altered and no
+		unrelated entry is deleted, so the audit trail is preserved.
+
+		Only applied while a return is being processed. Plain invoice
+		cancellation keeps core's guard untouched.
+		"""
+		if not frappe.flags.get("pos_next_loyalty_return"):
+			return super().delete_loyalty_point_entry()
+
+		own = frappe.get_all(
+			"Loyalty Point Entry", filters={"invoice": self.name}, pluck="name"
+		)
+		if not own:
+			return
+
+		orphans = frappe.get_all(
+			"Loyalty Point Entry",
+			filters={"redeem_against": ["in", own]},
+			fields=["name", "loyalty_points"],
+		)
+		for orphan in orphans:
+			donor = self._pos_next_find_donor_entry(
+				exclude=own, needed=abs(flt(orphan.loyalty_points))
+			)
+			# Re-point only. The redemption amount and its invoice are untouched.
+			frappe.db.set_value(
+				"Loyalty Point Entry", orphan.name, "redeem_against", donor, update_modified=False
+			)
+
+		frappe.db.delete("Loyalty Point Entry", {"invoice": self.name})
+		self.set_loyalty_program_tier()
+
+	def _pos_next_find_donor_entry(self, exclude, needed):
+		"""An earn entry with unredeemed capacity, or None."""
+		candidates = frappe.get_all(
+			"Loyalty Point Entry",
+			filters={
+				"customer": self.customer,
+				"loyalty_program": self.loyalty_program,
+				"company": self.company,
+				"loyalty_points": [">", 0],
+				"name": ["not in", exclude or [""]],
+			},
+			fields=["name", "loyalty_points"],
+			order_by="creation asc",
+		)
+		for cand in candidates:
+			used = flt(
+				frappe.db.sql(
+					"""select sum(abs(loyalty_points)) from `tabLoyalty Point Entry`
+					   where redeem_against = %s""",
+					cand.name,
+				)[0][0]
+				or 0
+			)
+			if flt(cand.loyalty_points) - used >= needed:
+				return cand.name
+		return None
+
+	def _pos_next_sync_retained_redemption(self):
+		"""Restore only the returned share of a redemption.
+
+		delete_loyalty_point_entry() removes the original's redemption row in
+		full, which over-restores on a partial return. A single compensating
+		row holds back the share that has NOT been returned. It is recomputed
+		from scratch on every return submit/cancel, so multiple partial returns
+		are cumulative and the operation is idempotent.
+		"""
+		original = frappe.get_doc("Sales Invoice", self.return_against)
+		if not original.loyalty_program:
+			return
+		if not (cint(original.redeem_loyalty_points) and cint(original.loyalty_points)):
+			return
+
+		# The row is keyed to the ORIGINAL invoice, not to a return, so that
+		# core's delete_loyalty_point_entry() clears it at the start of every
+		# return submit/cancel cycle. That makes this naturally idempotent and
+		# keeps it correct when the only return is later cancelled.
+		fraction = original._pos_next_returned_fraction()
+		retained = int(round(cint(original.loyalty_points) * (1.0 - fraction)))
+		if retained <= 0:
+			return
+
+		existing = frappe.get_all(
+			"Loyalty Point Entry",
+			filters={"invoice": original.name, "loyalty_points": ["<", 0]},
+			fields=["name", "loyalty_points"],
+		)
+		for row in existing:
+			if cint(row.loyalty_points) == -retained:
+				return                      # already correct - nothing to do
+			frappe.db.delete("Loyalty Point Entry", {"name": row.name})
+
+		doc = frappe.get_doc(
+			{
+				"doctype": "Loyalty Point Entry",
+				"company": original.company,
+				"loyalty_program": original.loyalty_program,
+				"customer": original.customer,
+				"invoice_type": "Sales Invoice",
+				"invoice": original.name,
+				"loyalty_points": -retained,
+				"purchase_amount": 0,
+				"expiry_date": original.posting_date,
+				"posting_date": original.posting_date,
+			}
+		)
+		doc.flags.ignore_permissions = 1
+		doc.save()
+
+	def _pos_next_is_loyalty_return(self):
+		return bool(
+			self.is_return and self.return_against and not self.is_consolidated and self.loyalty_program
+		)
+
+	def on_submit(self):
+		is_loyalty_return = self._pos_next_is_loyalty_return()
+		if is_loyalty_return:
+			frappe.flags.pos_next_loyalty_return = self.name
+		try:
+			super().on_submit()
+		finally:
+			if is_loyalty_return:
+				frappe.flags.pos_next_loyalty_return = None
+		if is_loyalty_return:
+			self._pos_next_sync_retained_redemption()
+
+	def on_cancel(self):
+		is_loyalty_return = self._pos_next_is_loyalty_return()
+		if is_loyalty_return:
+			frappe.flags.pos_next_loyalty_return = self.name
+		try:
+			super().on_cancel()
+		finally:
+			if is_loyalty_return:
+				frappe.flags.pos_next_loyalty_return = None
+		if is_loyalty_return:
+			self._pos_next_sync_retained_redemption()
+
 	def make_pos_gl_entries(self, gl_entries):
 		"""
 		Override to add party information for wallet payment accounts.
