@@ -287,3 +287,8 @@ scheduler_events = {
 
 
 website_route_rules = [{'from_route': '/pos/<path:app_path>', 'to_route': 'pos'},]
+
+# Build Hooks
+# -----------
+# Compile Vite frontend assets when bench build is called
+after_build = "pos_next.build.build_pos_frontend"
