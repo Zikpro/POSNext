@@ -151,23 +151,29 @@ class CustomSalesInvoice(SalesInvoice):
 		returned_amount, where returned_amount is the full return grand_total.
 		That subtracts the loyalty share twice. The eligible base is simply the
 		unreturned share of the non-loyalty value.
+
+		Also fixes core's cint(loyalty_amount) bug which truncates fractional
+		loyalty amounts (e.g. £3.98 becomes £3), causing earning to be computed
+		on an inflated eligible_amount. Uses flt() to preserve decimal precision.
 		"""
 		# Core's version assumes a programme is set, but the return path calls
 		# this on the ORIGINAL invoice, which may legitimately have none.
 		if not self.loyalty_program:
 			return
 
-		fraction = self._pos_next_returned_fraction()
-		if not fraction:
-			return super().make_loyalty_point_entry()
-
 		from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
 			get_loyalty_program_details_with_points,
 		)
 		from frappe.utils import add_days, getdate
 
+		fraction = self._pos_next_returned_fraction()
 		net_of_loyalty = flt(self.grand_total) - flt(self.loyalty_amount)
-		eligible_amount = net_of_loyalty * (1.0 - fraction)
+
+		if fraction:
+			eligible_amount = net_of_loyalty * (1.0 - fraction)
+		else:
+			returned_amount = self.get_returned_amount()
+			eligible_amount = net_of_loyalty - returned_amount
 
 		lp_details = get_loyalty_program_details_with_points(
 			self.customer,
