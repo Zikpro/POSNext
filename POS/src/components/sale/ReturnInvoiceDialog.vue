@@ -1282,23 +1282,31 @@ const returnedValueFraction = computed(() => {
 	return Math.min(1, returnTotal.value / originalTotal)
 })
 
-/**
- * Maximum loyalty that can be restored for this return.
- * This is the ORIGINAL redeemed loyalty amount from the sale, never reduced.
- * The actual restoration is capped by the remaining return value after monetary refund.
- */
-const originalLoyaltyAmount = computed(() => {
+/** Loyalty redeemed on the original sale, in currency. */
+const redeemedLoyaltyAmount = computed(() => {
 	if (!Number(originalInvoice.value?.redeem_loyalty_points)) return 0
 	return Math.abs(Number(originalInvoice.value?.loyalty_amount) || 0)
+})
+
+/**
+ * Maximum loyalty that can be restored for this return: the redeemed loyalty
+ * less what earlier returns already restored (sent by the backend). The actual
+ * restoration is capped by the remaining return value after monetary refund.
+ */
+const originalLoyaltyAmount = computed(() => {
+	if (!redeemedLoyaltyAmount.value) return 0
+	const restorable = originalInvoice.value?.loyalty_restorable_amount
+	return restorable === undefined || restorable === null
+		? redeemedLoyaltyAmount.value
+		: Math.abs(Number(restorable) || 0)
 })
 
 /** Loyalty points handed back to the customer for this return. */
 const loyaltyPointsRestored = computed(() => {
 	const points = Math.abs(Number(originalInvoice.value?.loyalty_points) || 0)
-	if (!points || !loyaltyToRestore.value) return 0
-	// Prorate points based on what's actually being restored
-	const ratio = loyaltyToRestore.value / originalLoyaltyAmount.value
-	return Math.round(points * ratio)
+	if (!points || !loyaltyToRestore.value || !redeemedLoyaltyAmount.value) return 0
+	// Whole points at the original redemption rate, rounded down like the backend
+	return Math.floor((loyaltyToRestore.value * points) / redeemedLoyaltyAmount.value + 1e-6)
 })
 
 /**
@@ -1313,13 +1321,30 @@ const originalMonetaryPaid = computed(() => {
 	return Math.max(0, roundCurrency(originalPaidAmount.value - loyaltyAmount))
 })
 
-/** What may actually be refunded as money, once loyalty is excluded. */
 /**
- * Maximum monetary refund the cashier can enter.
- * Loyalty fills the remaining gap, but is never more than original_loyalty_amount.
- * So: monetary can be up to return_value.
+ * Maximum monetary refund the cashier can enter: the return value, and never
+ * more than the original still has refundable as money after earlier returns
+ * (sent by the backend, which enforces the same limit). Loyalty fills the gap.
  */
-const refundableTotal = computed(() => returnTotal.value)
+const refundableTotal = computed(() => {
+	const refundable = originalInvoice.value?.monetary_refundable_amount
+	if (refundable === undefined || refundable === null) return returnTotal.value
+	return roundCurrency(Math.min(returnTotal.value, Math.abs(Number(refundable) || 0)))
+})
+
+/**
+ * Default money refund: the original payment split applied to the value being
+ * returned (e.g. a £100 sale paid £80 money + £20 points refunds £40 money and
+ * restores £10 of points when £50 is returned). The cashier may edit it.
+ */
+const defaultMonetaryRefund = computed(() => {
+	const grandTotal = Math.abs(Number(originalInvoice.value?.grand_total) || 0)
+	const loyaltyShare = grandTotal
+		? Math.min(originalLoyaltyAmount.value, (returnTotal.value * redeemedLoyaltyAmount.value) / grandTotal)
+		: 0
+	const cap = isPartiallyPaid.value ? maxRefundableAmount.value : refundableTotal.value
+	return roundCurrency(Math.max(0, Math.min(cap, returnTotal.value - roundCurrency(loyaltyShare))))
+})
 
 const maxRefundableAmount = computed(() => {
 	if (!originalInvoice.value) return 0
@@ -1442,8 +1467,7 @@ watch(normalizedSearchTerm, (searchTerm) => {
 	}, SEARCH_DEBOUNCE_MS)
 })
 
-// When items are selected/changed, re-initialize payment rows based on full/partial status.
-// Full return: seed from original. Partial: start empty for cashier control.
+// When items are selected/changed, re-seed the default refund split for the new return value.
 watch(selectedItems, () => {
 	if (returnModal.visible && originalInvoice.value && paymentMethods.value.length) {
 		initializePaymentsFromInvoice()
@@ -1523,17 +1547,6 @@ function addPaymentRow() {
 }
 
 /**
- * Whether this is a full or partial return.
- * Full: entire original invoice is being returned.
- * Partial: only some items/qty are being returned.
- */
-const isFullReturn = computed(() => {
-	if (!originalInvoice.value) return false
-	const origTotal = Math.abs(Number(originalInvoice.value.grand_total) || 0)
-	return Math.abs(returnTotal.value - origTotal) < 0.01
-})
-
-/**
  * How much monetary the user has actually entered for refund.
  */
 const monetaryTenderedAmount = computed(() =>
@@ -1611,23 +1624,26 @@ function initializePaymentsFromInvoice() {
 			? new Set(refundMethods.value.map((m) => m.mode_of_payment))
 			: null
 
-		if (isFullReturn.value) {
-			// FULL return: preserve the original monetary/loyalty split.
-			// Seed payment rows from original monetary amounts.
-			// Loyalty will auto-fill to match the original split.
-			refundPayments.value = invoicePayments.map((payment) => ({
+		// Full and partial returns: seed the default money refund, split across
+		// the original payment modes in their original proportions. The cashier
+		// may edit the amounts; loyalty automatically fills the remaining gap.
+		const paidTotal = invoicePayments.reduce((sum, p) => sum + Math.abs(Number(p.amount) || 0), 0)
+		const target = defaultMonetaryRefund.value
+		let allocated = 0
+		refundPayments.value = invoicePayments.map((payment, index) => {
+			const amount =
+				index === invoicePayments.length - 1 || !paidTotal
+					? roundCurrency(target - allocated)
+					: roundCurrency((target * Math.abs(Number(payment.amount) || 0)) / paidTotal)
+			allocated = roundCurrency(allocated + amount)
+			return {
 				mode_of_payment:
 					currentModes && !currentModes.has(payment.mode_of_payment)
 						? defaultMode
 						: payment.mode_of_payment,
-				amount: Math.abs(payment.amount),
-			}))
-		} else {
-			// PARTIAL return: cashier controls monetary amount.
-			// Loyalty automatically fills the remaining eligible portion.
-			// Start with empty rows for cashier to enter amounts.
-			refundPayments.value = []
-		}
+				amount,
+			}
+		})
 	} else {
 		// Fully loyalty-settled original: nothing to refund as money.
 		refundPayments.value = []

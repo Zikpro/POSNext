@@ -110,9 +110,9 @@ def process_loyalty_to_wallet(doc, method=None):
 			return
 
 		# Create wallet transaction
-		from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import create_wallet_credit
+		from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import _create_wallet_credit
 
-		transaction = create_wallet_credit(
+		transaction = _create_wallet_credit(
 			wallet=wallet.name,
 			amount=credit_amount,
 			source_type="Loyalty Program",
@@ -369,7 +369,15 @@ def get_or_create_wallet(customer, company, pos_settings=None, force_create=Fals
 		})
 		wallet_doc.insert(ignore_permissions=True)
 
-		return wallet_doc
+		# Same shape as the existing-wallet branch above, so callers can use
+		# wallet.name and wallet["name"] alike whether or not it was just created.
+		return frappe._dict(
+			name=wallet_doc.name,
+			customer=wallet_doc.customer,
+			company=wallet_doc.company,
+			account=wallet_doc.account,
+			status=wallet_doc.status,
+		)
 
 	except Exception as e:
 		frappe.log_error(
@@ -542,9 +550,9 @@ def create_manual_wallet_credit(customer, company, amount, remarks=None):
 	if not wallet:
 		frappe.throw(_("Could not create wallet for customer {0}").format(customer))
 
-	from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import create_wallet_credit
+	from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import _create_wallet_credit
 
-	transaction = create_wallet_credit(
+	transaction = _create_wallet_credit(
 		wallet=wallet.name if hasattr(wallet, 'name') else wallet["name"],
 		amount=amount,
 		source_type="Manual Adjustment",

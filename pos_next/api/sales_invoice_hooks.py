@@ -121,12 +121,21 @@ def auto_assign_loyalty_program_on_invoice(doc):
 def before_cancel(doc, method=None):
 	"""
 	Before Cancel hook for Sales Invoice.
-	Cancel any credit redemption journal entries.
+	Cancel the loyalty wallet transactions derived from the invoice and any
+	credit redemption journal entries.
 
 	Args:
 		doc: Sales Invoice document
 		method: Hook method name (unused)
 	"""
+	# Not swallowed: if these cannot be cancelled the invoice must not be
+	# cancelled either, or the wallet would keep a credit for a voided sale.
+	from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import (
+		cancel_loyalty_wallet_transactions,
+	)
+
+	cancel_loyalty_wallet_transactions(doc)
+
 	try:
 		from pos_next.api.credit_sales import cancel_credit_journal_entries
 		cancel_credit_journal_entries(doc.name)

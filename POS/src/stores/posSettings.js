@@ -13,7 +13,7 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		default_loyalty_program: "",
 		wallet_account: "",
 		auto_create_wallet: 1,
-		loyalty_to_wallet: 1,
+		loyalty_to_wallet: 0,
 		// General Settings
 		max_discount_allowed: 0,
 		use_percentage_discount: 0,
@@ -299,7 +299,7 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 			default_loyalty_program: "",
 			wallet_account: "",
 			auto_create_wallet: 1,
-			loyalty_to_wallet: 1,
+			loyalty_to_wallet: 0,
 			// General Settings
 			max_discount_allowed: 0,
 			use_percentage_discount: 0,

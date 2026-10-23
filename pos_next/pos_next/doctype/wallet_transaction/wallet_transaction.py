@@ -194,6 +194,22 @@ class WalletTransaction(AccountsController):
 def create_wallet_credit(wallet, amount, source_type="Manual Adjustment", remarks=None,
 						 reference_doctype=None, reference_name=None, submit=True):
 	"""
+	API entry point: create a wallet credit transaction.
+
+	The transaction is inserted with ignore_permissions, so callers over HTTP
+	must hold create permission on Wallet Transaction. Server-side code calls
+	_create_wallet_credit() directly.
+	"""
+	frappe.has_permission("Wallet Transaction", "create", throw=True)
+	return _create_wallet_credit(
+		wallet, amount, source_type=source_type, remarks=remarks,
+		reference_doctype=reference_doctype, reference_name=reference_name, submit=submit,
+	)
+
+
+def _create_wallet_credit(wallet, amount, source_type="Manual Adjustment", remarks=None,
+						  reference_doctype=None, reference_name=None, submit=True):
+	"""
 	Create a wallet credit transaction.
 
 	Args:
@@ -264,6 +280,8 @@ def credit_loyalty_points_to_wallet(customer, company, loyalty_points, conversio
 	Returns:
 		Wallet Transaction document or None
 	"""
+	frappe.has_permission("Wallet Transaction", "create", throw=True)
+
 	if flt(loyalty_points) <= 0:
 		return None
 
@@ -288,7 +306,7 @@ def credit_loyalty_points_to_wallet(customer, company, loyalty_points, conversio
 	wallet = get_or_create_wallet(customer, company, force_create=True)
 
 	# Create wallet credit transaction
-	transaction = create_wallet_credit(
+	transaction = _create_wallet_credit(
 		wallet=wallet["name"],
 		amount=credit_amount,
 		source_type="Loyalty Program",
@@ -439,168 +457,159 @@ def credit_return_to_wallet(return_invoice, amount=None):
 @frappe.whitelist()
 def reverse_wallet_transactions_for_return(original_invoice, return_invoice):
 	"""
-	Reverse wallet transactions linked to the original invoice when a return is made.
+	Bring the Loyalty Credit of the original invoice in line after a return.
 
-	For full returns: Cancel the linked Wallet Transaction(s)
-	For partial returns: Create a proportional Debit transaction to reverse the credit
+	Called once the return is submitted, when the original's Loyalty Point
+	Entries have already been rebuilt. See sync_loyalty_wallet_credit().
 
 	Args:
 		original_invoice: Original Sales Invoice name
 		return_invoice: Return Sales Invoice name (is_return=1)
 	"""
-	# Get the return invoice to calculate return ratio
-	return_doc = frappe.get_doc("Sales Invoice", return_invoice)
-	original_doc = frappe.get_doc("Sales Invoice", original_invoice)
-
-	if not return_doc.is_return or return_doc.return_against != original_invoice:
+	return_data = frappe.db.get_value(
+		"Sales Invoice", return_invoice, ["is_return", "return_against"], as_dict=True
+	)
+	if not return_data or not return_data.is_return or return_data.return_against != original_invoice:
 		return
 
-	existing = frappe.db.exists("Wallet Transaction", {
+	# A retried submission must not post a second reversal for the same return.
+	if frappe.db.exists("Wallet Transaction", {
 		"reference_doctype": "Sales Invoice",
 		"reference_name": return_invoice,
 		"transaction_type": "Debit",
-		"source_type": "Refund",
 		"docstatus": ["!=", 2],
-	})
-	if existing:
+	}):
 		return
-	# Find all submitted Wallet Transactions linked to the original invoice
-	wallet_transactions = frappe.get_all(
+
+	sync_loyalty_wallet_credit(original_invoice, reference_invoice=return_invoice)
+
+
+def _loyalty_credit_target(original):
+	"""Wallet value of the loyalty points the invoice still earns."""
+	points = flt(frappe.db.sql(
+		"""select sum(loyalty_points) from `tabLoyalty Point Entry`
+		   where invoice = %s and loyalty_points > 0 and ifnull(redeem_against, '') = ''""",
+		original.name,
+	)[0][0])
+	program = original.loyalty_program or frappe.db.get_value("Customer", original.customer, "loyalty_program")
+	conversion = flt(frappe.db.get_value("Loyalty Program", program, "conversion_factor")) if program else 0.0
+	return flt(points * conversion, 2)
+
+
+def sync_loyalty_wallet_credit(original_invoice, reference_invoice=None):
+	"""
+	Keep the Loyalty Credit of an invoice equal to the points it still earns.
+
+	The credit was created as earned points x conversion factor, so after any
+	return (or return cancellation) the target is the points the invoice still
+	earns x conversion factor. The net credited so far is the submitted Loyalty
+	Credits less the reversal Debits of its returns; only the difference is
+	posted, which keeps repeated and partial returns cumulative and correct.
+	A full return with no earlier reversal cancels the credit outright.
+
+	Only Loyalty Credit transactions and their reversals are touched. Genuine
+	wallet credits (refunds, manual credits) are separate and never change here.
+	"""
+	original = frappe.db.get_value(
+		"Sales Invoice", original_invoice,
+		["name", "docstatus", "customer", "company", "loyalty_program"], as_dict=True,
+	)
+	if not original or original.docstatus != 1:
+		return
+
+	credits = frappe.get_all(
 		"Wallet Transaction",
 		filters={
 			"reference_doctype": "Sales Invoice",
 			"reference_name": original_invoice,
-			"docstatus": 1,
-			"transaction_type": ["in", ["Credit", "Loyalty Credit"]]
+			"transaction_type": "Loyalty Credit",
+			"docstatus": ["in", [1, 2]],
 		},
-		fields=["name", "wallet", "amount", "transaction_type", "source_type",
-				"source_account", "company", "customer"]
+		fields=["name", "wallet", "amount", "source_account", "company", "docstatus"],
+		order_by="creation asc",
+	)
+	if not credits:
+		return  # this invoice never converted points to wallet money
+
+	submitted = [c for c in credits if c.docstatus == 1]
+	returns = frappe.get_all(
+		"Sales Invoice", filters={"is_return": 1, "return_against": original_invoice}, pluck="name"
+	)
+	debits = frappe.get_all(
+		"Wallet Transaction",
+		filters={
+			"reference_doctype": "Sales Invoice",
+			"reference_name": ["in", returns or [""]],
+			"transaction_type": "Debit",
+			"docstatus": 1,
+		},
+		fields=["name", "amount"],
 	)
 
-	if not wallet_transactions:
+	net = flt(sum(flt(c.amount) for c in submitted) - sum(flt(d.amount) for d in debits), 2)
+	target = _loyalty_credit_target(original)
+	difference = flt(net - target, 2)
+	if abs(difference) < 0.01:
 		return
 
-	# return grand_total is negative, original is positive
-	original_total = abs(flt(original_doc.grand_total))
-	returned_amount = abs(flt(return_doc.grand_total))
+	template = credits[0]
+	reference = reference_invoice or original_invoice
 
-	if original_total <= 0:
-		return
-
-	# Check if this is a full return
-	# Keep full precision for ratio; only round the final reverse_amount
-	return_ratio = returned_amount / original_total
-	is_full_return = return_ratio >= 0.999  # Allow small rounding tolerance
-
-	# Get loyalty program details for tier-aware reversal of Loyalty Credit.
-	# Supports both "Single Tier Program" (one rule) and "Multiple Tier Program" (many rules).
-	# Original credit: points = int(eligible_amount / collection_factor), wallet = points * conversion_factor
-	loyalty_program = frappe.db.get_value("Customer", original_doc.customer, "loyalty_program")
-
-	tiers = []
-	conversion_factor = 1.0
-	if loyalty_program:
-		lp_doc = frappe.get_doc("Loyalty Program", loyalty_program)
-		conversion_factor = flt(lp_doc.conversion_factor) or 1.0
-		tiers = sorted(
-			[d.as_dict() for d in lp_doc.collection_rules],
-			key=lambda r: flt(r.get("min_spent")),
+	if difference > 0 and target <= 0 and not debits:
+		for credit in submitted:
+			wt_doc = frappe.get_doc("Wallet Transaction", credit.name)
+			wt_doc.flags.ignore_permissions = True
+			wt_doc.cancel()
+		frappe.msgprint(
+			_("Cancelled loyalty wallet credit for {0}").format(original_invoice),
+			alert=True, indicator="blue",
 		)
+		return
 
-	invoiced_amount_after_return = flt(original_total) - flt(returned_amount)
+	transaction = frappe.get_doc({
+		"doctype": "Wallet Transaction",
+		"transaction_type": "Debit" if difference > 0 else "Loyalty Credit",
+		"wallet": template.wallet,
+		"company": template.company,
+		"posting_date": today(),
+		"amount": abs(difference),
+		"source_type": "Refund" if difference > 0 else "Loyalty Program",
+		"source_account": template.source_account,
+		"reference_doctype": "Sales Invoice",
+		"reference_name": reference,
+		"remarks": _("Loyalty wallet credit for {0} adjusted to {1} after {2}: {3} {4}").format(
+			original_invoice,
+			frappe.format_value(target, {"fieldtype": "Currency"}),
+			reference,
+			_("reversed") if difference > 0 else _("restored"),
+			frappe.format_value(abs(difference), {"fieldtype": "Currency"}),
+		),
+	})
+	transaction.flags.ignore_permissions = True
+	transaction.insert()
+	transaction.submit()
 
-	def _find_tier(amount):
-		"""Return the highest tier whose min_spent <= amount, or None."""
-		matched = None
-		for t in tiers:
-			if flt(amount) >= flt(t.get("min_spent")):
-				matched = t
-		return matched
 
-	# Determine the applicable tier for the post-return effective amount
-	new_tier = _find_tier(invoiced_amount_after_return) if tiers else None
+def cancel_loyalty_wallet_transactions(invoice):
+	"""
+	Cancel the loyalty wallet transactions derived from an invoice before it is
+	cancelled, so the invoice is not blocked by the link and the wallet follows.
 
-	for wt in wallet_transactions:
-		# ── Decide: cancel entirely  OR  create a partial Debit ──
-		should_cancel = False
-		reverse_amount = 0
-
-		if is_full_return:
-			should_cancel = True
-
-		elif wt.transaction_type == "Loyalty Credit" and tiers:
-			# Tier-aware reversal for Loyalty Credit
-			if not new_tier:
-				# Post-return amount below the lowest tier's min_spent → reverse ALL
-				should_cancel = True
-			else:
-				# Recalculate what the credit should be for the post-return amount
-				new_cf = flt(new_tier.get("collection_factor")) or 1.0
-				recalculated_points = int(flt(invoiced_amount_after_return) / new_cf)
-				recalculated_credit = flt(recalculated_points) * flt(conversion_factor)
-				reverse_amount = flt(flt(wt.amount) - recalculated_credit, 2)
-
-				if flt(reverse_amount) >= flt(wt.amount):
-					# Recalculated credit is zero or negative → cancel entirely
-					should_cancel = True
-					reverse_amount = 0
-
-		else:
-			# Regular Credit (or Loyalty Credit without tiers) → proportional reversal
-			reverse_amount = flt(wt.amount * return_ratio, 2)
-
-		# ── Execute the reversal ──
-		if should_cancel:
-			try:
-				wt_doc = frappe.get_doc("Wallet Transaction", wt.name)
-				wt_doc.flags.ignore_permissions = True
-				wt_doc.cancel()
-				frappe.msgprint(
-					_("Cancelled Wallet Transaction {0} due to return").format(wt.name),
-					alert=True, indicator="blue"
-				)
-			except Exception as e:
-				frappe.log_error(
-					title="Wallet Transaction Cancel on Return Error",
-					message=f"WT: {wt.name}, Return: {return_invoice}, Error: {str(e)}\n{frappe.get_traceback()}"
-				)
-
-		elif reverse_amount > 0:
-			try:
-				reverse_wt = frappe.get_doc({
-					"doctype": "Wallet Transaction",
-					"transaction_type": "Debit",
-					"wallet": wt.wallet,
-					"company": wt.company,
-					"posting_date": today(),
-					"amount": reverse_amount,
-					"source_type": "Refund",
-					"source_account": wt.source_account,
-					"reference_doctype": "Sales Invoice",
-					"reference_name": return_invoice,
-					"remarks": _("Wallet reversal for return {0} against {1}: returned {2}, reversed {3}").format(
-						return_invoice, original_invoice,
-						frappe.format_value(returned_amount, {"fieldtype": "Currency"}),
-						frappe.format_value(reverse_amount, {"fieldtype": "Currency"})
-					)
-				})
-				reverse_wt.flags.ignore_permissions = True
-				reverse_wt.insert()
-				reverse_wt.submit()
-
-				frappe.msgprint(
-					_("Created wallet debit of {0} for partial return {1}").format(
-						frappe.format_value(reverse_amount, {"fieldtype": "Currency"}),
-						return_invoice
-					),
-					alert=True, indicator="blue"
-				)
-			except Exception as e:
-				frappe.log_error(
-					title="Wallet Transaction Reverse on Partial Return Error",
-					message=(
-						f"WT: {wt.name}, Return: {return_invoice}, "
-						f"Original: {original_invoice}, Reverse Amount: {reverse_amount}, "
-						f"Error: {str(e)}\n{frappe.get_traceback()}"
-					)
-				)
+	A sale's Loyalty Credit, or a return's loyalty reversal Debit. Refund
+	credits to the wallet are genuine money and are left for a deliberate
+	decision (the link keeps blocking cancellation of that return).
+	"""
+	transaction_type = "Debit" if invoice.get("is_return") else "Loyalty Credit"
+	for name in frappe.get_all(
+		"Wallet Transaction",
+		filters={
+			"reference_doctype": "Sales Invoice",
+			"reference_name": invoice.name,
+			"transaction_type": transaction_type,
+			"docstatus": 1,
+		},
+		pluck="name",
+	):
+		wt_doc = frappe.get_doc("Wallet Transaction", name)
+		wt_doc.flags.ignore_permissions = True
+		wt_doc.cancel()

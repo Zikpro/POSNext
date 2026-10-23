@@ -112,45 +112,21 @@ class CustomSalesInvoice(SalesInvoice):
 	#      points were later redeemed elsewhere, making such a return
 	#      impossible.
 	#
-	# The returned share is DERIVED as a VALUE RATIO of the two grand totals.
-	# A ratio on one consistent basis carries no double-count risk, and unlike a
-	# quantity ratio it stays correct for mixed-price baskets and discounts.
+	# Each return records the points it restored (see
+	# pos_next.api.invoices._apply_loyalty_share_to_return). The retained
+	# redemption and the recalculated earning are rebuilt from those records,
+	# so the loyalty restored always matches the money refunded and the same
+	# loyalty value can never be restored twice.
 	# ------------------------------------------------------------------
-
-	def _pos_next_returned_fraction(self):
-		"""Fraction of this invoice returned so far, by VALUE (0.0 - 1.0).
-
-		Value-based so that returning the cheap line of a mixed-price basket
-		restores only its own share: a quantity ratio would hand back half the
-		loyalty for one of two items regardless of their prices. Both totals
-		already include discounts and taxes, so the ratio needs no adjustment.
-
-		Cumulative across every submitted return, which keeps multiple partial
-		returns correct and makes the callers idempotent.
-		"""
-		original_total = abs(flt(self.grand_total))
-		if not original_total:
-			return 0.0
-
-		returned_total = abs(
-			flt(
-				frappe.db.sql(
-					"""select sum(grand_total) from `tabSales Invoice`
-					   where docstatus = 1 and is_return = 1 and return_against = %s""",
-					self.name,
-				)[0][0]
-				or 0
-			)
-		)
-		return min(1.0, returned_total / original_total)
 
 	def make_loyalty_point_entry(self):
 		"""Recreate the earned entry using a loyalty-aware returned amount.
 
 		Core computes eligible_amount = (grand_total - loyalty_amount) -
 		returned_amount, where returned_amount is the full return grand_total.
-		That subtracts the loyalty share twice. The eligible base is simply the
-		unreturned share of the non-loyalty value.
+		That subtracts the loyalty share twice. The eligible base is the money
+		the customer kept: each return gives back its value less the loyalty it
+		restored as points.
 
 		Also fixes core's cint(loyalty_amount) bug which truncates fractional
 		loyalty amounts (e.g. £3.98 becomes £3), causing earning to be computed
@@ -166,14 +142,10 @@ class CustomSalesInvoice(SalesInvoice):
 		)
 		from frappe.utils import add_days, getdate
 
-		fraction = self._pos_next_returned_fraction()
-		net_of_loyalty = flt(self.grand_total) - flt(self.loyalty_amount)
+		from pos_next.api.invoices import _loyalty_return_state
 
-		if fraction:
-			eligible_amount = net_of_loyalty * (1.0 - fraction)
-		else:
-			returned_amount = self.get_returned_amount()
-			eligible_amount = net_of_loyalty - returned_amount
+		net_of_loyalty = flt(self.grand_total) - flt(self.loyalty_amount)
+		eligible_amount = max(0.0, net_of_loyalty - _loyalty_return_state(self).money_returned)
 
 		lp_details = get_loyalty_program_details_with_points(
 			self.customer,
@@ -277,13 +249,13 @@ class CustomSalesInvoice(SalesInvoice):
 		return None
 
 	def _pos_next_sync_retained_redemption(self):
-		"""Restore only the returned share of a redemption.
+		"""Restore only the points the returns actually restored.
 
 		delete_loyalty_point_entry() removes the original's redemption row in
 		full, which over-restores on a partial return. A single compensating
-		row holds back the share that has NOT been returned. It is recomputed
-		from scratch on every return submit/cancel, so multiple partial returns
-		are cumulative and the operation is idempotent.
+		row holds back the points no submitted return has restored. It is
+		recomputed from scratch on every return submit/cancel, so multiple
+		partial returns are cumulative and the operation is idempotent.
 		"""
 		original = frappe.get_doc("Sales Invoice", self.return_against)
 		if not original.loyalty_program:
@@ -295,8 +267,10 @@ class CustomSalesInvoice(SalesInvoice):
 		# core's delete_loyalty_point_entry() clears it at the start of every
 		# return submit/cancel cycle. That makes this naturally idempotent and
 		# keeps it correct when the only return is later cancelled.
-		fraction = original._pos_next_returned_fraction()
-		retained = int(round(cint(original.loyalty_points) * (1.0 - fraction)))
+		from pos_next.api.invoices import _loyalty_return_state
+
+		state = _loyalty_return_state(original)
+		retained = state.points - state.restored_points
 		if retained <= 0:
 			return
 
@@ -355,6 +329,13 @@ class CustomSalesInvoice(SalesInvoice):
 				frappe.flags.pos_next_loyalty_return = None
 		if is_loyalty_return:
 			self._pos_next_sync_retained_redemption()
+			# The original earns its points again, so its loyalty wallet credit
+			# (if points were ever converted) is brought back in line too.
+			from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import (
+				sync_loyalty_wallet_credit,
+			)
+
+			sync_loyalty_wallet_credit(self.return_against)
 
 	def make_pos_gl_entries(self, gl_entries):
 		"""

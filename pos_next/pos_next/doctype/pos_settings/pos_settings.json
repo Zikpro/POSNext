@@ -149,13 +149,12 @@
    "read_only_depends_on": "enable_loyalty_program"
   },
   {
-   "default": "1",
+   "default": "0",
    "depends_on": "enable_loyalty_program",
-   "description": "Automatically convert earned loyalty points to wallet balance. Uses Conversion Factor from Loyalty Program (always enabled when loyalty program is active)",
+   "description": "Also credit earned loyalty points to the customer wallet as money (points x Conversion Factor). Leave unchecked when customers redeem loyalty points at the till: the points stay redeemable, so enabling this rewards the same purchase twice.",
    "fieldname": "loyalty_to_wallet",
    "fieldtype": "Check",
-   "label": "Convert Loyalty Points to Wallet",
-   "read_only_depends_on": "enable_loyalty_program"
+   "label": "Convert Loyalty Points to Wallet"
   },
   {
    "fieldname": "section_break_general",

@@ -1289,6 +1289,21 @@ def submit_invoice(invoice=None, data=None):
     # Track whether invoice was successfully submitted
     invoice_submitted = False
 
+    # The refund the cashier asked for, read from the payload before ERPNext's
+    # set_total_amount_to_default_mop() can rewrite an over-tendered return
+    # (it replaces the rows with "return total - tendered", e.g. 25.00 tendered
+    # on a 22.45 return becomes a 2.55 refund). Validated in
+    # _apply_loyalty_share_to_return().
+    requested_refund = None
+    if invoice.get("is_return") and invoice.get("payments") is not None:
+        requested_refund = flt(
+            sum(
+                abs(flt(p.get("amount")))
+                for p in (invoice.get("payments") or [])
+                if p.get("mode_of_payment") != LOYALTY_MODE_OF_PAYMENT
+            )
+        )
+
     try:
         invoice_name = invoice.get("name")
 
@@ -1450,7 +1465,12 @@ def submit_invoice(invoice=None, data=None):
         # Loyalty handling for returns. Applied after save() so the return's own
         # grand_total is available, and before submit() so the validate pass that
         # runs during submit sees the final tender and write-off.
-        loyalty_share = _apply_loyalty_share_to_return(invoice_doc, pos_profile)
+        loyalty_share = _apply_loyalty_share_to_return(
+            invoice_doc,
+            pos_profile,
+            add_to_customer_balance=invoice.get("add_to_customer_balance"),
+            requested_refund=requested_refund,
+        )
 
         # Submit invoice
         invoice_doc.submit()
@@ -1481,43 +1501,52 @@ def submit_invoice(invoice=None, data=None):
                 )
 
         # Credit return amount to customer wallet when "Add to Customer Credit Balance" is enabled.
-        # Only proceed if the wallet reversal above succeeded (or was not needed) to
-        # avoid double-crediting the customer when reversal fails.
-        if invoice_doc.get("is_return"):
-            add_to_customer_balance = invoice.get("add_to_customer_balance")
-            has_return_against = bool(invoice_doc.get("return_against"))
-            if add_to_customer_balance and (wallet_reversal_ok or not has_return_against):
-                from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import credit_return_to_wallet
+        # This is part of the return itself: if the credit cannot be posted, or the
+        # wallet reversal above failed (crediting then could double-credit the
+        # customer), raise so the whole return rolls back and can be retried,
+        # instead of committing a return whose refund went nowhere.
+        if invoice_doc.get("is_return") and invoice.get("add_to_customer_balance"):
+            if invoice_doc.get("return_against") and not wallet_reversal_ok:
+                invoice_submitted = False  # rolled back with the error below
+                frappe.throw(
+                    _("The return could not be credited to the customer wallet because the wallet reversal for {0} failed. Nothing was saved; please retry or contact an administrator.").format(
+                        invoice_doc.return_against
+                    ),
+                    title=_("Wallet Credit Failed"),
+                )
+
+            from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import credit_return_to_wallet
+
+            # The loyalty share returns as points, so exclude it from the
+            # wallet credit. loyalty_share is 0 for every non-loyalty return,
+            # leaving those unchanged.
+            credit_amount = flt(
+                abs(flt(invoice_doc.grand_total)) - flt(loyalty_share),
+                invoice_doc.precision("grand_total"),
+            )
+            # A fully loyalty-settled return owes no money, so there is nothing
+            # to credit. The call is skipped rather than made with 0 -
+            # credit_return_to_wallet() would read a falsy amount as "not
+            # supplied" and credit the full grand_total.
+            if credit_amount > 0:
                 try:
-                    # The loyalty share returns as points, so exclude it from
-                    # the wallet credit. loyalty_share is 0 for every
-                    # non-loyalty return, leaving those unchanged.
-                    credit_amount = flt(
-                        abs(flt(invoice_doc.grand_total)) - flt(loyalty_share),
-                        invoice_doc.precision("grand_total"),
+                    credited = credit_return_to_wallet(
+                        return_invoice=invoice_doc.name, amount=credit_amount
                     )
-                    # A fully loyalty-settled return owes no money, so there is
-                    # nothing to credit. The call is skipped rather than made
-                    # with 0 - credit_return_to_wallet() would read a falsy
-                    # amount as "not supplied" and credit the full grand_total.
-                    if credit_amount > 0:
-                        credit_return_to_wallet(
-                            return_invoice=invoice_doc.name,
-                            amount=credit_amount
-                        )
-                except Exception as wallet_credit_error:
-                    frappe.log_error(
-                        title="Wallet Credit on Return Error",
-                        message=(
-                            f"Return invoice: {invoice_doc.name}, "
-                            f"Error: {str(wallet_credit_error)}\n{frappe.get_traceback()}"
-                        )
-                    )
-                    frappe.msgprint(
-                        _("Return submitted but wallet credit failed. Please contact administrator."),
-                        alert=True,
-                        indicator="orange"
-                    )
+                except Exception:
+                    invoice_submitted = False  # the return rolls back with this error
+                    raise
+            else:
+                credited = True
+            if not credited:
+                invoice_submitted = False  # rolled back with the error below
+                frappe.throw(
+                    _("{0} could not be credited to the customer wallet for return {1}. Nothing was saved; check the wallet account settings and retry.").format(
+                        frappe.format_value(credit_amount, {"fieldtype": "Currency"}), invoice_doc.name
+                    ),
+                    title=_("Wallet Credit Failed"),
+                )
+
         # Complete the offline sync record
         if sync_record_name:
             _complete_offline_sync(sync_record_name, invoice_doc.name)
@@ -2130,71 +2159,113 @@ def _build_item_tax_map(taxes: list) -> dict:
 LOYALTY_MODE_OF_PAYMENT = "Redeem Points"
 
 
-def _loyalty_share_for_return(return_doc):
-    """Currency value of loyalty to restore for THIS return.
+def _loyalty_return_state(original, exclude_return=None):
+    """Loyalty and money position of an original invoice across its returns.
 
-    This is DYNAMIC based on what the cashier entered as monetary payment:
+    Each return records the points it restored on itself (negative
+    loyalty_points, with loyalty_redemption_account marking a POSNext record).
+    Returns submitted before that record existed fall back to the proportional
+    share the previous implementation restored, so their history is unchanged.
 
-        loyalty_to_restore = min(
-            original_loyalty_amount,
-            return_value - monetary_paid
-        )
-
-    The cashier controls the monetary refund, and loyalty fills the remaining gap
-    (capped by the original redeemed loyalty amount).
-
-    Returns 0.0 for any return whose original had no loyalty redemption.
+    Money returned by a return is its value less the loyalty it restored, so a
+    refund the cashier chose not to pay out (left as customer credit) still
+    counts as returned money.
     """
-    original = frappe.db.get_value(
+    points = cint(original.get("loyalty_points")) if cint(original.get("redeem_loyalty_points")) else 0
+    amount = flt(original.get("loyalty_amount")) if points else 0.0
+    grand_total = abs(flt(original.get("grand_total")))
+    conversion = amount / points if points else 0.0
+    precision = cint(frappe.get_cached_value("System Settings", None, "currency_precision")) or 2
+
+    filters = {"docstatus": 1, "is_return": 1, "return_against": original.get("name")}
+    if exclude_return:
+        filters["name"] = ["!=", exclude_return]
+    returns = frappe.get_all(
         "Sales Invoice",
-        return_doc.return_against,
-        ["name", "loyalty_amount", "grand_total", "redeem_loyalty_points"],
-        as_dict=True,
-    )
-    if not original or not cint(original.redeem_loyalty_points):
-        return 0.0
-
-    original_loyalty = flt(original.loyalty_amount)
-    return_total = abs(flt(return_doc.grand_total))
-    if original_loyalty <= 0 or return_total <= 0:
-        return 0.0
-
-    # Calculate what the cashier actually paid (sum of monetary payment rows)
-    # Loyalty will fill: min(original_loyalty, return_value - monetary_paid)
-    monetary_paid = flt(
-        sum(
-            abs(flt(p.amount))
-            for p in (return_doc.get("payments") or [])
-            if p.mode_of_payment != LOYALTY_MODE_OF_PAYMENT
-        )
+        filters=filters,
+        fields=["grand_total", "loyalty_points", "loyalty_redemption_account"],
     )
 
-    loyalty_to_restore = min(
-        original_loyalty,
-        max(0.0, return_total - monetary_paid),
+    returned_value = 0.0
+    restored_points = 0
+    for row in returns:
+        value = abs(flt(row.grand_total))
+        returned_value += value
+        if not points:
+            continue
+        if row.loyalty_redemption_account:
+            restored_points += abs(cint(row.loyalty_points))
+        elif grand_total:
+            restored_points += int(round(points * value / grand_total))
+    restored_points = min(restored_points, points)
+
+    monetary_paid = max(
+        0.0, flt(original.get("paid_amount")) - flt(original.get("change_amount")) - amount
     )
-    return flt(loyalty_to_restore, return_doc.precision("write_off_amount"))
+    money_returned = max(0.0, returned_value - restored_points * conversion)
+
+    return frappe._dict(
+        points=points,
+        amount=amount,
+        conversion=conversion,
+        grand_total=grand_total,
+        returned_value=returned_value,
+        restored_points=restored_points,
+        restorable_points=points - restored_points,
+        restorable_amount=flt((points - restored_points) * conversion, precision),
+        monetary_paid=monetary_paid,
+        money_returned=money_returned,
+        monetary_refundable=max(0.0, flt(monetary_paid - money_returned, precision)),
+    )
 
 
-def _apply_loyalty_share_to_return(invoice_doc, pos_profile=None):
+def _apply_loyalty_share_to_return(
+    invoice_doc, pos_profile=None, add_to_customer_balance=False, requested_refund=None
+):
     """Make the backend authoritative over the loyalty/money split of a return.
 
-    The loyalty-settled share of a return comes back to the customer as restored
-    loyalty points, not as money. Writing that share off keeps it off Debtors so
-    it cannot also become a cash refund or an artificial customer credit.
+    The money refunded is what the cashier tendered (editable in the POS), or,
+    when the refund goes to the customer wallet, the default split taken from
+    the original invoice. Money above the return value, or above what the
+    original was actually paid in money, is rejected. The loyalty restored is
+    the remaining gap, capped by the loyalty still restorable, and is recorded
+    on the return so it can never be restored twice.
 
-    The write-off is NEGATIVE on purpose: make_write_off_gl_entry() credits
-    debit_to, and on a return Debtors already carries the loyalty share as a
-    credit, so a negative write-off debits it back to zero.
+    The loyalty-settled share comes back as points, not money. Writing that
+    share off keeps it off Debtors so it cannot also become a cash refund or an
+    artificial customer credit, and posting it to the original redemption
+    account reverses the loyalty expense. The write-off is NEGATIVE on purpose:
+    make_write_off_gl_entry() credits debit_to, and on a return Debtors already
+    carries the loyalty share as a credit, so a negative write-off debits it
+    back to zero. Returns the loyalty share actually applied.
 
-    Everything is derived here rather than trusted from the client, so a stale
-    cached bundle or a direct API call cannot produce a wrong refund. Returns the
-    loyalty share actually applied.
+    requested_refund is the money the cashier asked for, taken from the request
+    payload; when given it is validated instead of the payment rows, which
+    ERPNext may already have rewritten for an over-tendered return.
     """
     if not (invoice_doc.get("is_return") and invoice_doc.get("return_against")):
         return 0.0
 
-    loyalty_share = _loyalty_share_for_return(invoice_doc)
+    precision = invoice_doc.precision("grand_total")
+    tolerance = 0.5 / (10 ** cint(precision))
+    return_total = abs(flt(invoice_doc.grand_total))
+
+    def _reject(money, max_money):
+        frappe.throw(
+            _(
+                "Refund {0} is more than {1}, the most this return can refund as money. "
+                "The rest of its value is restored as loyalty points."
+            ).format(
+                frappe.format_value(money, {"fieldtype": "Currency"}),
+                frappe.format_value(max_money, {"fieldtype": "Currency"}),
+            ),
+            title=_("Refund Exceeds Limit"),
+        )
+
+    # No return can refund more money than its own value, loyalty or not.
+    if requested_refund is not None and not add_to_customer_balance:
+        if flt(requested_refund, precision) > return_total + tolerance:
+            _reject(flt(requested_refund, precision), return_total)
 
     # Loyalty is never a payment row. A row against the loyalty mode would post
     # real money to that mode's account, so drop it whatever the client sent.
@@ -2205,51 +2276,90 @@ def _apply_loyalty_share_to_return(invoice_doc, pos_profile=None):
     ]:
         invoice_doc.remove(row)
 
+    original = frappe.db.get_value(
+        "Sales Invoice",
+        invoice_doc.return_against,
+        [
+            "name", "grand_total", "paid_amount", "change_amount", "loyalty_amount",
+            "loyalty_points", "redeem_loyalty_points", "loyalty_program",
+            "loyalty_redemption_account", "loyalty_redemption_cost_center",
+        ],
+        as_dict=True,
+    )
+    state = _loyalty_return_state(original, exclude_return=invoice_doc.name) if original else None
+    if not (state and state.points):
+        return 0.0
+
+    rows = invoice_doc.get("payments") or []
+
+    if add_to_customer_balance and not rows:
+        default_loyalty = min(
+            state.restorable_amount,
+            flt(return_total * state.amount / state.grand_total, precision) if state.grand_total else 0.0,
+        )
+        money = min(flt(return_total - default_loyalty, precision), state.monetary_refundable)
+    else:
+        money = flt(
+            requested_refund if requested_refund is not None else sum(abs(flt(p.amount)) for p in rows),
+            precision,
+        )
+        max_money = flt(min(return_total, state.monetary_refundable), precision)
+        if money > max_money + tolerance:
+            _reject(money, max_money)
+
+    loyalty_value = min(state.restorable_amount, max(0.0, return_total - money))
+    points = cint(flt(loyalty_value / state.conversion, 6)) if state.conversion else 0
+    loyalty_share = flt(points * state.conversion, precision)
+
+    redemption_account = original.loyalty_redemption_account or frappe.db.get_value(
+        "Loyalty Program", original.loyalty_program, "expense_account"
+    )
+    if not redemption_account:
+        frappe.throw(
+            _("Set an Expense Account on Loyalty Program {0} before returning invoice {1}.").format(
+                original.loyalty_program, original.name
+            )
+        )
+
+    # Record exactly what this return restored. redeem_loyalty_points stays 0,
+    # so ERPNext ignores these fields; the Sales Invoice override reads them
+    # when it rebuilds the original's Loyalty Point Entries.
+    invoice_doc.redeem_loyalty_points = 0
+    invoice_doc.loyalty_points = -points
+    invoice_doc.loyalty_amount = -loyalty_share
+    invoice_doc.loyalty_redemption_account = redemption_account
+    invoice_doc.loyalty_redemption_cost_center = original.loyalty_redemption_cost_center
+
     if not loyalty_share:
         return 0.0
 
-    currency_precision = invoice_doc.precision("grand_total")
-    conversion_rate = flt(invoice_doc.conversion_rate) or 1.0
-    return_total = abs(flt(invoice_doc.grand_total))
-
-    # Cap the monetary tender at the non-loyalty share. Clamped DOWNWARD only:
-    # a deliberate shortfall on a partially-paid or credit-sale original stays
-    # as outstanding, exactly as before.
-    cap = flt(return_total - loyalty_share, currency_precision)
-    rows = invoice_doc.get("payments") or []
-    tendered = flt(sum(abs(flt(p.amount)) for p in rows), currency_precision)
-
-    if tendered > cap:
-        if cap <= 0:
-            for row in list(rows):
-                invoice_doc.remove(row)
-        else:
-            scale = cap / tendered
-            allocated = 0.0
-            for index, row in enumerate(rows):
-                if index == len(rows) - 1:
-                    scaled = flt(cap - allocated, currency_precision)
-                else:
-                    scaled = flt(abs(flt(row.amount)) * scale, currency_precision)
-                    allocated = flt(allocated + scaled, currency_precision)
-                # Refund rows are negative; keep whatever sign the row carries.
-                row.amount = -scaled if flt(row.amount) < 0 else scaled
-                row.base_amount = flt(flt(row.amount) * conversion_rate, currency_precision)
-
-    # Preserve any pre-existing legitimate write-off by subtracting from it.
     # Deliberately not subject to POS Profile.write_off_limit - this is an
     # accounting consequence of the original sale, not a cashier decision.
+    conversion_rate = flt(invoice_doc.conversion_rate) or 1.0
     write_off_precision = invoice_doc.precision("write_off_amount")
-    adjusted = flt(flt(invoice_doc.get("write_off_amount")) - loyalty_share, write_off_precision)
+    existing_write_off = flt(invoice_doc.get("write_off_amount"), write_off_precision)
+    adjusted = flt(existing_write_off - loyalty_share, write_off_precision)
     invoice_doc.write_off_amount = adjusted
     invoice_doc.base_write_off_amount = flt(adjusted * conversion_rate, write_off_precision)
-    invoice_doc.write_off_account = (
-        invoice_doc.get("write_off_account")
-        or frappe.get_cached_value("Company", invoice_doc.company, "write_off_account")
-        or frappe.db.get_value("POS Profile", pos_profile, "write_off_account")
-    )
-    if not invoice_doc.get("write_off_cost_center"):
-        invoice_doc.write_off_cost_center = invoice_doc.get("cost_center")
+
+    if not existing_write_off:
+        # The write-off is purely the restored loyalty, so it reverses the
+        # original redemption: same account, same cost centre that
+        # make_loyalty_point_redemption_gle() used on the original sale.
+        invoice_doc.write_off_account = redemption_account
+        invoice_doc.write_off_cost_center = (
+            invoice_doc.get("cost_center") or original.loyalty_redemption_cost_center
+        )
+    else:
+        # A pre-existing write-off has its own account and one write-off field
+        # cannot post to two accounts, so keep that account for the total.
+        invoice_doc.write_off_account = (
+            invoice_doc.get("write_off_account")
+            or frappe.get_cached_value("Company", invoice_doc.company, "write_off_account")
+            or frappe.db.get_value("POS Profile", pos_profile, "write_off_account")
+        )
+        if not invoice_doc.get("write_off_cost_center"):
+            invoice_doc.write_off_cost_center = invoice_doc.get("cost_center")
 
     return loyalty_share
 
@@ -2432,7 +2542,8 @@ def prepare_return_invoice(invoice_name, pos_opening_shift=None):
             # and to seed the monetary tender without the loyalty share.
             si.loyalty_amount,
             si.loyalty_points,
-            si.redeem_loyalty_points
+            si.redeem_loyalty_points,
+            si.change_amount
         )
         .where(si.name == invoice_name)
     ).run(as_dict=True)
@@ -2558,6 +2669,15 @@ def prepare_return_invoice(invoice_name, pos_opening_shift=None):
         "redeem_loyalty_points": invoice_info.redeem_loyalty_points,
     }
 
+    # What earlier returns left: the loyalty still restorable and the money
+    # still refundable. The backend enforces the same limits on submit.
+    return_state = _loyalty_return_state(frappe._dict(invoice_info, name=invoice_name))
+    return_dict["_original_invoice"].update({
+        "loyalty_restorable_amount": return_state.restorable_amount,
+        "loyalty_restorable_points": return_state.restorable_points,
+        "monetary_refundable_amount": return_state.monetary_refundable,
+    })
+
     item_tax_map = _build_item_tax_map(return_dict.get("taxes", []))
 
     # Check if taxes are inclusive by inspecting the tax rows copied from the original
@@ -2574,11 +2694,25 @@ def prepare_return_invoice(invoice_name, pos_opening_shift=None):
 
     precision = cint(frappe.get_cached_value("System Settings", None, "currency_precision")) or 2
 
+    # make_sales_return() already reduced each row's qty by earlier returns, so
+    # the original quantity is read from the original invoice row; subtracting
+    # returned_qty_map from the reduced qty would count earlier returns twice.
+    original_row_qty = {
+        row.name: abs(flt(row.qty))
+        for row in frappe.get_all(
+            "Sales Invoice Item", filters={"parent": invoice_name}, fields=["name", "qty"]
+        )
+    }
+
     def process_return_item(item):
         """Process single item for return, returns None if not returnable."""
         item_ref = item.get("sales_invoice_item") or item.get("item_code")
-        original_qty = abs(flt(item.get("qty", 0)))
-        remaining_qty = original_qty - returned_qty_map.get(item_ref, 0)
+        if item.get("sales_invoice_item") in original_row_qty:
+            original_qty = original_row_qty[item.get("sales_invoice_item")]
+            remaining_qty = original_qty - returned_qty_map.get(item_ref, 0)
+        else:
+            remaining_qty = abs(flt(item.get("qty", 0)))
+            original_qty = remaining_qty + returned_qty_map.get(item_ref, 0)
 
         if remaining_qty <= 0:
             return None

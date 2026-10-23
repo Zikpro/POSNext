@@ -14,6 +14,31 @@ from frappe import _
 from frappe.utils import flt, nowdate, today, cint, get_datetime
 
 
+def _wallet_credited_amounts(return_invoices):
+	"""Amount of each return already refunded to the customer wallet.
+
+	A return refunded to the wallet keeps its negative outstanding, so without
+	this the same refund could be redeemed again as customer credit.
+	"""
+	if not return_invoices:
+		return {}
+	rows = frappe.get_all(
+		"Wallet Transaction",
+		filters={
+			"docstatus": 1,
+			"transaction_type": "Credit",
+			"source_type": "Refund",
+			"reference_doctype": "Sales Invoice",
+			"reference_name": ["in", list(return_invoices)],
+		},
+		fields=["reference_name", "amount"],
+	)
+	credited = {}
+	for row in rows:
+		credited[row.reference_name] = flt(credited.get(row.reference_name)) + flt(row.amount)
+	return credited
+
+
 @frappe.whitelist()
 def get_customer_balance(customer, company=None):
 	"""
@@ -46,7 +71,7 @@ def get_customer_balance(customer, company=None):
 
 	try:
 		from frappe.query_builder import DocType
-		from frappe.query_builder.functions import Sum, Abs, Coalesce
+		from frappe.query_builder.functions import Sum, Coalesce
 		from pypika import Case
 
 		SalesInvoice = DocType("Sales Invoice")
@@ -84,9 +109,7 @@ def get_customer_balance(customer, company=None):
 		# If no cash refund (added to customer credit), outstanding_amount < 0
 		return_query = (
 			frappe.qb.from_(SalesInvoice)
-			.select(
-				Coalesce(Sum(Abs(SalesInvoice.outstanding_amount)), 0).as_("return_credit")
-			)
+			.select(SalesInvoice.name, SalesInvoice.outstanding_amount)
 			.where(
 				base_filters &
 				(SalesInvoice.is_return == 1) &
@@ -100,8 +123,13 @@ def get_customer_balance(customer, company=None):
 
 		# Calculate totals
 		total_outstanding = flt(regular_result[0].total_outstanding) if regular_result else 0.0
-		# Credit only comes from return invoices where no cash refund was given
-		total_credit = flt(return_result[0].return_credit) if return_result else 0.0
+		# Credit only comes from return invoices where no cash refund was given,
+		# less anything already refunded to the customer wallet for them.
+		wallet_credited = _wallet_credited_amounts([row.name for row in return_result])
+		total_credit = sum(
+			max(0.0, abs(flt(row.outstanding_amount)) - flt(wallet_credited.get(row.name)))
+			for row in return_result
+		)
 
 		# Net balance: positive = owes, negative = has credit
 		net_balance = total_outstanding - total_credit
@@ -193,9 +221,11 @@ def get_available_credit(customer, company, pos_profile=None):
 		order_by="posting_date desc"
 	)
 
+	wallet_credited = _wallet_credited_amounts([row.name for row in outstanding_invoices])
 	for row in outstanding_invoices:
-		# Outstanding is negative, so make it positive for display
-		available_credit = -flt(row.outstanding_amount)
+		# Outstanding is negative, so make it positive for display. Whatever was
+		# refunded to the wallet for this return is not available again here.
+		available_credit = -flt(row.outstanding_amount) - flt(wallet_credited.get(row.name))
 
 		if available_credit > 0:
 			total_credit.append({
@@ -385,7 +415,8 @@ def _validate_and_lock_invoice_credit(invoice_name, amount_to_redeem, customer, 
 	)
 
 	current_outstanding = flt(result[0].outstanding_amount)
-	available_credit = -current_outstanding  # Credit is negative outstanding
+	# Credit is negative outstanding, less anything already refunded to the wallet
+	available_credit = -current_outstanding - flt(_wallet_credited_amounts([invoice_name]).get(invoice_name))
 
 	if available_credit < amount_to_redeem:
 		frappe.throw(
