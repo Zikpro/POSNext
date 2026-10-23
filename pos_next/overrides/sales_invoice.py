@@ -86,6 +86,49 @@ def _get_post_change_gl_entries_setting():
 	return cint(result[0][0]) if result else 0
 
 
+def _pos_next_allocate_redemption(invoice, points):
+	"""Spread an invoice's redeemed points over the customer's earn entries.
+
+	Picks entries the way core redemption (apply_loyalty_points) does: valid
+	on the invoice's posting date, earliest expiry first, Sales Invoice
+	entries only and never the invoice's own. Unlike core, an entry's spare
+	points subtract its earlier redemptions; core adds them, because
+	redemption points are stored as negative numbers.
+
+	Returns [(redeem_against, expiry_date, loyalty_program_tier, points)].
+	Points no entry has room for go on a final row that expires with the
+	latest entry, so they still count against the balance.
+	"""
+	from erpnext.accounts.doctype.loyalty_point_entry.loyalty_point_entry import (
+		get_loyalty_point_entries,
+		get_redemption_details,
+	)
+
+	points = cint(points)
+	entries = get_loyalty_point_entries(
+		invoice.customer, invoice.loyalty_program, invoice.company, invoice.posting_date
+	)
+	redeemed = get_redemption_details(invoice.customer, invoice.loyalty_program, invoice.company)
+
+	allocations = []
+	for entry in entries:
+		if entry.invoice_type != "Sales Invoice" or entry.invoice == invoice.name:
+			continue
+		spare = cint(entry.loyalty_points + flt(redeemed.get(entry.name)))
+		if spare <= 0:
+			continue
+		taken = min(spare, points)
+		allocations.append((entry.name, entry.expiry_date, entry.loyalty_program_tier, taken))
+		points -= taken
+		if points <= 0:
+			return allocations
+
+	if points > 0:
+		latest = max((entry.expiry_date for entry in entries), default=invoice.posting_date)
+		allocations.append((None, latest, None, points))
+	return allocations
+
+
 class CustomSalesInvoice(SalesInvoice):
 	"""
 	Custom Sales Invoice class that handles wallet payments correctly.
@@ -252,10 +295,15 @@ class CustomSalesInvoice(SalesInvoice):
 		"""Restore only the points the returns actually restored.
 
 		delete_loyalty_point_entry() removes the original's redemption row in
-		full, which over-restores on a partial return. A single compensating
-		row holds back the points no submitted return has restored. It is
-		recomputed from scratch on every return submit/cancel, so multiple
-		partial returns are cumulative and the operation is idempotent.
+		full, which over-restores on a partial return. Compensating rows hold
+		back the points no submitted return has restored. They are recomputed
+		from scratch on every return submit/cancel, so multiple partial returns
+		are cumulative and the operation is idempotent.
+
+		Like core redemption rows, each one is redeemed against an earn entry
+		and carries that entry's expiry date. The balance only counts entries
+		that have not expired, so a row expiring sooner than the points it
+		holds back would hand those points back to the customer.
 		"""
 		original = frappe.get_doc("Sales Invoice", self.return_against)
 		if not original.loyalty_program:
@@ -263,7 +311,7 @@ class CustomSalesInvoice(SalesInvoice):
 		if not (cint(original.redeem_loyalty_points) and cint(original.loyalty_points)):
 			return
 
-		# The row is keyed to the ORIGINAL invoice, not to a return, so that
+		# The rows are keyed to the ORIGINAL invoice, not to a return, so that
 		# core's delete_loyalty_point_entry() clears it at the start of every
 		# return submit/cancel cycle. That makes this naturally idempotent and
 		# keeps it correct when the only return is later cancelled.
@@ -274,32 +322,60 @@ class CustomSalesInvoice(SalesInvoice):
 		if retained <= 0:
 			return
 
-		existing = frappe.get_all(
-			"Loyalty Point Entry",
-			filters={"invoice": original.name, "loyalty_points": ["<", 0]},
-			fields=["name", "loyalty_points"],
+		frappe.db.delete(
+			"Loyalty Point Entry", {"invoice": original.name, "loyalty_points": ["<", 0]}
 		)
-		for row in existing:
-			if cint(row.loyalty_points) == -retained:
-				return                      # already correct - nothing to do
-			frappe.db.delete("Loyalty Point Entry", {"name": row.name})
 
-		doc = frappe.get_doc(
-			{
-				"doctype": "Loyalty Point Entry",
-				"company": original.company,
-				"loyalty_program": original.loyalty_program,
-				"customer": original.customer,
-				"invoice_type": "Sales Invoice",
-				"invoice": original.name,
-				"loyalty_points": -retained,
-				"purchase_amount": 0,
-				"expiry_date": original.posting_date,
-				"posting_date": original.posting_date,
-			}
-		)
-		doc.flags.ignore_permissions = 1
-		doc.save()
+		for redeem_against, expiry_date, _tier, points in _pos_next_allocate_redemption(original, retained):
+			doc = frappe.get_doc(
+				{
+					"doctype": "Loyalty Point Entry",
+					"company": original.company,
+					"loyalty_program": original.loyalty_program,
+					"customer": original.customer,
+					"invoice_type": "Sales Invoice",
+					"invoice": original.name,
+					"redeem_against": redeem_against,
+					"loyalty_points": -points,
+					"purchase_amount": 0,
+					"expiry_date": expiry_date,
+					"posting_date": original.posting_date,
+				}
+			)
+			doc.flags.ignore_permissions = 1
+			doc.save()
+
+	def apply_loyalty_points(self):
+		"""Core redemption with each earn entry's spare points computed correctly.
+
+		Core takes an entry's spare points as its points minus its earlier
+		redemptions, but redemptions are stored as negative points, so it adds
+		them and every redemption makes the entry look bigger (17, 34, 68 ...).
+		Redemptions pile onto the earliest-expiring entry and, carrying its
+		expiry date, leave the balance with it: points already spent come back.
+		The rows written are otherwise the same as core's.
+		"""
+		for redeem_against, expiry_date, tier, points in _pos_next_allocate_redemption(
+			self, self.loyalty_points
+		):
+			doc = frappe.get_doc(
+				{
+					"doctype": "Loyalty Point Entry",
+					"company": self.company,
+					"loyalty_program": self.loyalty_program,
+					"loyalty_program_tier": tier,
+					"customer": self.customer,
+					"invoice_type": self.doctype,
+					"invoice": self.name,
+					"redeem_against": redeem_against,
+					"loyalty_points": -points,
+					"purchase_amount": self.grand_total,
+					"expiry_date": expiry_date,
+					"posting_date": self.posting_date,
+				}
+			)
+			doc.flags.ignore_permissions = 1
+			doc.save()
 
 	def _pos_next_is_loyalty_return(self):
 		return bool(

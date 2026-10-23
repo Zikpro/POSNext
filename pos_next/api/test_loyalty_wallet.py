@@ -298,3 +298,129 @@ class TestSyncLoyaltyWalletCredit(unittest.TestCase):
 
 	def test_nothing_to_do_when_in_line(self):
 		self.assertEqual(self._sync([self._credit(0.53)], [], target=0.53), [])
+
+
+_LPE = "erpnext.accounts.doctype.loyalty_point_entry.loyalty_point_entry"
+
+
+def _entry(name, points, expiry, invoice="SINV-EARN", invoice_type="Sales Invoice"):
+	return {"name": name, "loyalty_points": points, "expiry_date": expiry, "invoice": invoice,
+	        "invoice_type": invoice_type, "loyalty_program_tier": "Standard"}
+
+
+def _patch_ledger(entries, redeemed):
+	"""Patch core's earn-entry and redemption queries with the given ledger."""
+	rows = [frappe._dict(row) for row in entries]
+	return patch(f"{_LPE}.get_loyalty_point_entries", return_value=rows), patch(
+		f"{_LPE}.get_redemption_details", return_value=frappe._dict(redeemed)
+	)
+
+
+class TestAllocateRedemption(unittest.TestCase):
+	"""Redeemed and held-back points are taken from earn entries and expire with them."""
+
+	invoice = frappe._dict(
+		name="SINV-ORIG", customer="Cust", loyalty_program="LP", company="Co", posting_date="2026-10-01"
+	)
+
+	def _allocate(self, entries, redeemed, points):
+		from pos_next.overrides.sales_invoice import _pos_next_allocate_redemption
+
+		entries_patch, redeemed_patch = _patch_ledger(entries, redeemed)
+		with entries_patch as get_entries, redeemed_patch:
+			rows = _pos_next_allocate_redemption(self.invoice, points)
+		# Only entries still valid on the invoice date are offered (expired ones are not)
+		get_entries.assert_called_once_with("Cust", "LP", "Co", "2026-10-01")
+		return [(name, expiry, points) for name, expiry, _tier, points in rows]
+
+	def test_rows_carry_the_expiry_of_the_entries_they_use(self):
+		entries = [_entry("E1", 300, "2026-10-31"), _entry("E2", 1000, "2026-11-15")]
+		self.assertEqual(
+			self._allocate(entries, {}, 449), [("E1", "2026-10-31", 300), ("E2", "2026-11-15", 149)]
+		)
+
+	def test_spare_points_subtract_earlier_redemptions(self):
+		# Redemption points are stored negative: E1 has 100 left, not 1900
+		entries = [_entry("E1", 1000, "2026-10-31"), _entry("E2", 1000, "2026-11-15")]
+		self.assertEqual(
+			self._allocate(entries, {"E1": -900}, 449), [("E1", "2026-10-31", 100), ("E2", "2026-11-15", 349)]
+		)
+
+	def test_overspent_entry_from_old_data_is_skipped(self):
+		# 1721 already charged to a 17-point entry by the old calculation
+		entries = [_entry("E1", 17, "2026-10-31"), _entry("E2", 4000, "2026-11-15")]
+		self.assertEqual(self._allocate(entries, {"E1": -1721}, 100), [("E2", "2026-11-15", 100)])
+
+	def test_skips_the_invoices_own_entry_and_other_doctypes(self):
+		entries = [
+			_entry("OWN", 5000, "2026-10-10", invoice="SINV-ORIG"),
+			_entry("JE", 5000, "2026-10-10", invoice_type="Journal Entry"),
+			_entry("E1", 1000, "2026-10-31"),
+		]
+		self.assertEqual(self._allocate(entries, {}, 449), [("E1", "2026-10-31", 449)])
+
+	def test_points_without_room_expire_with_the_latest_entry(self):
+		entries = [_entry("E1", 100, "2026-10-31"), _entry("E2", 50, "2026-11-15")]
+		self.assertEqual(
+			self._allocate(entries, {"E2": -50}, 449), [("E1", "2026-10-31", 100), (None, "2026-11-15", 349)]
+		)
+
+	def test_never_expires_on_the_original_posting_date_while_entries_exist(self):
+		rows = self._allocate([_entry("E1", 4000, "2026-10-31")], {}, 449)
+		self.assertNotIn(self.invoice.posting_date, [expiry for _, expiry, _ in rows])
+
+
+class TestApplyLoyaltyPoints(unittest.TestCase):
+	"""Redemption at the till: points earned, partly and fully redeemed, never charged twice."""
+
+	def _redeem(self, entries, redeemed, points):
+		from pos_next.overrides import sales_invoice as override
+
+		invoice = frappe._dict(
+			doctype="Sales Invoice", name="SINV-NEW", customer="Cust", loyalty_program="LP", company="Co",
+			posting_date="2026-10-23", grand_total=13.47, loyalty_points=points,
+		)
+		saved = []
+
+		def fake_get_doc(values):
+			doc = frappe._dict(values, flags=frappe._dict())
+			doc.save = lambda: saved.append(doc)
+			return doc
+
+		entries_patch, redeemed_patch = _patch_ledger(entries, redeemed)
+		with entries_patch, redeemed_patch, patch.object(override.frappe, "get_doc", side_effect=fake_get_doc):
+			override.CustomSalesInvoice.apply_loyalty_points(invoice)
+		return saved
+
+	def test_partial_redemption_uses_the_earliest_expiring_points_first(self):
+		rows = self._redeem([_entry("OLD", 35, "2026-11-12"), _entry("NEW", 4000, "2026-11-22")], {}, 20)
+		self.assertEqual([(r.redeem_against, r.loyalty_points, r.expiry_date) for r in rows], [("OLD", -20, "2026-11-12")])
+		row = rows[0]
+		self.assertEqual(
+			(row.invoice_type, row.invoice, row.purchase_amount, row.loyalty_program_tier, row.flags.ignore_permissions),
+			("Sales Invoice", "SINV-NEW", 13.47, "Standard", 1),
+		)
+
+	def test_second_redemption_does_not_charge_used_points_again(self):
+		# Core would see OLD as 35 + 35 = 70 spare and charge it 70 more
+		rows = self._redeem(
+			[_entry("OLD", 35, "2026-11-12"), _entry("NEW", 4000, "2026-11-22")], {"OLD": -35, "NEW": -965}, 1000
+		)
+		self.assertEqual([(r.redeem_against, r.loyalty_points) for r in rows], [("NEW", -1000)])
+
+	def test_full_redemption_spans_entries(self):
+		rows = self._redeem(
+			[_entry("OLD", 35, "2026-11-12"), _entry("NEW", 4000, "2026-11-22")], {"OLD": -20}, 4015
+		)
+		self.assertEqual(
+			[(r.redeem_against, r.loyalty_points, r.expiry_date) for r in rows],
+			[("OLD", -15, "2026-11-12"), ("NEW", -4000, "2026-11-22")],
+		)
+
+	def test_core_still_calls_the_override(self):
+		# If an ERPNext upgrade moves redemption elsewhere, this override would stop running
+		import inspect
+
+		from erpnext.accounts.doctype.sales_invoice.sales_invoice import SalesInvoice
+
+		self.assertIn("self.apply_loyalty_points()", inspect.getsource(SalesInvoice.on_submit))
