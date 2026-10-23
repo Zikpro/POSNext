@@ -231,6 +231,48 @@
 					</div>
 				</div>
 			</div>
+
+			<!-- Scan Error: replaced (not stacked) by the next error, cleared by a good scan -->
+			<div
+				v-if="scanError"
+				:key="scanError.id"
+				role="alert"
+				class="mt-1.5 sm:mt-2 flex items-start gap-2 rounded-lg border-2 border-red-500 bg-red-50 px-2.5 sm:px-3 py-2 text-red-800"
+			>
+				<svg class="w-5 h-5 flex-shrink-0 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+				</svg>
+				<div class="flex-1 min-w-0">
+					<p class="text-xs sm:text-sm font-semibold">
+						{{ scanError.kind === 'not_found'
+							? __('Barcode Not Found — Please Check the Barcode or Item Catalogue.')
+							: __('Could not check barcode {0}', [scanError.barcode]) }}
+					</p>
+					<p class="text-[11px] sm:text-xs break-all">
+						{{ scanError.kind === 'not_found'
+							? __('Scanned barcode: {0}', [scanError.barcode])
+							: scanError.reason }}
+					</p>
+				</div>
+				<span
+					v-if="scanError.count > 1"
+					class="flex-shrink-0 rounded-full bg-red-600 px-2 py-0.5 text-[10px] sm:text-xs font-bold text-white"
+					:aria-label="__('Scanned {0} times', [scanError.count])"
+				>
+					×{{ scanError.count }}
+				</span>
+				<button
+					type="button"
+					@click="dismissScanError(); focusSearchInput()"
+					class="flex-shrink-0 p-0.5 rounded text-red-600 hover:bg-red-100 active:bg-red-200 touch-manipulation"
+					:title="__('Dismiss')"
+					:aria-label="__('Dismiss')"
+				>
+					<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+					</svg>
+				</button>
+			</div>
 		</div>
 
 		<!-- Initial Loading State - Show spinner while fetching items -->
@@ -753,7 +795,7 @@ const emit = defineEmits(["item-selected"])
 // Use composables
 const { getStockStatus } = useStock()
 const settingsStore = usePOSSettingsStore()
-const { showError, showWarning } = useToast()
+const { showError } = useToast()
 const { isAnyDialogOpen } = useDialogState()
 
 // Use Pinia store
@@ -777,14 +819,14 @@ const {
 
 // Search input composable — owns search/scanner state, timers, concurrency
 const {
-	searchInputRef, scannerEnabled, autoAddEnabled,
-	handleSearchInput, handleKeyDown, handleSearchClick,
+	searchInputRef, scannerEnabled, autoAddEnabled, scanError,
+	handleSearchInput, handleKeyDown, handleSearchClick, dismissScanError,
 	toggleBarcodeScanner, toggleAutoAdd, focusSearchInput,
 	clearSearchAndResetInput,
 	cleanup: cleanupSearchInput,
 } = useSearchInput({
 	itemStore, onItemFound: selectItem,
-	showWarning, isAnyDialogOpen,
+	isAnyDialogOpen,
 })
 
 // Local state

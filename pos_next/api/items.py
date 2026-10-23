@@ -28,6 +28,10 @@ ITEM_RESULT_FIELDS = [
 	"disabled",
 ]
 
+
+class BarcodeNotFoundError(frappe.ValidationError):
+	"""No item matches the scanned barcode. The POS shows its own "not found" message for this type."""
+
 ITEM_RESULT_COLUMNS = ",\n\t".join(ITEM_RESULT_FIELDS)
 
 
@@ -342,7 +346,7 @@ def search_by_barcode(barcode, pos_profile):
 			barcode_uom = None
 
 		if not item_code:
-			frappe.throw(_("Item with barcode {0} not found").format(barcode))
+			frappe.throw(_("Item with barcode {0} not found").format(barcode), BarcodeNotFoundError)
 
 		# Get POS Profile details
 		pos_profile_doc = frappe.get_cached_doc("POS Profile", pos_profile)
@@ -415,6 +419,9 @@ def search_by_barcode(barcode, pos_profile):
 				item_details.update(resolved_item_data)
 
 		return item_details
+	except BarcodeNotFoundError:
+		# An unknown barcode is a normal outcome of scanning, not a system error
+		raise
 	except Exception as e:
 		frappe.log_error(frappe.get_traceback(), "Search by Barcode Error")
 		frappe.throw(_("Error searching by barcode: {0}").format(str(e)))
