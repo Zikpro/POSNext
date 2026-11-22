@@ -232,31 +232,33 @@
 				</div>
 			</div>
 
-			<!-- Scan Error: replaced (not stacked) by the next error, cleared by a good scan -->
+			<!-- Scan Error: stays until the next scan or a dismiss; a repeat counts up, a new barcode replaces it -->
 			<div
 				v-if="scanError"
 				:key="scanError.id"
 				role="alert"
-				class="mt-1.5 sm:mt-2 flex items-start gap-2 rounded-lg border-2 border-red-500 bg-red-50 px-2.5 sm:px-3 py-2 text-red-800"
+				class="mt-1.5 sm:mt-2 flex items-start gap-2 sm:gap-3 rounded-lg border-2 border-red-700 bg-red-600 px-2.5 sm:px-3 py-2 sm:py-2.5 text-white shadow-md"
 			>
-				<svg class="w-5 h-5 flex-shrink-0 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+				<svg class="w-6 h-6 sm:w-7 sm:h-7 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
 					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
 				</svg>
 				<div class="flex-1 min-w-0">
-					<p class="text-xs sm:text-sm font-semibold">
+					<p class="text-sm sm:text-base font-bold leading-snug">
 						{{ scanError.kind === 'not_found'
 							? __('Barcode Not Found — Please Check the Barcode or Item Catalogue.')
 							: __('Could not check barcode {0}', [scanError.barcode]) }}
 					</p>
-					<p class="text-[11px] sm:text-xs break-all">
-						{{ scanError.kind === 'not_found'
-							? __('Scanned barcode: {0}', [scanError.barcode])
-							: scanError.reason }}
+					<p v-if="scanError.kind === 'not_found'" class="mt-1 text-xs sm:text-sm">
+						{{ __('Scanned barcode:') }}
+						<span class="ms-1 inline-block max-w-full break-all rounded bg-white px-1.5 py-0.5 font-mono font-bold text-red-700">{{ scanError.barcode }}</span>
+					</p>
+					<p v-else class="mt-1 text-xs sm:text-sm break-words">
+						{{ scanError.reason }}
 					</p>
 				</div>
 				<span
 					v-if="scanError.count > 1"
-					class="flex-shrink-0 rounded-full bg-red-600 px-2 py-0.5 text-[10px] sm:text-xs font-bold text-white"
+					class="flex-shrink-0 self-center rounded-full bg-white px-2 py-0.5 text-xs font-bold text-red-700"
 					:aria-label="__('Scanned {0} times', [scanError.count])"
 				>
 					×{{ scanError.count }}
@@ -264,7 +266,7 @@
 				<button
 					type="button"
 					@click="dismissScanError(); focusSearchInput()"
-					class="flex-shrink-0 p-0.5 rounded text-red-600 hover:bg-red-100 active:bg-red-200 touch-manipulation"
+					class="flex-shrink-0 w-8 h-8 flex items-center justify-center rounded-md bg-red-700 hover:bg-red-800 active:bg-red-900 touch-manipulation"
 					:title="__('Dismiss')"
 					:aria-label="__('Dismiss')"
 				>

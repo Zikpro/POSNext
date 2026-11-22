@@ -11,9 +11,10 @@ import {
 } from "vitest"
 import { defineComponent, h, ref } from "vue"
 import {
-	SCAN_ERROR_DURATION,
-	useSearchInput,
-} from "@/composables/useSearchInput"
+	BEEP_MIN_INTERVAL_MS,
+	resetBarcodeBeepForTests,
+} from "@/utils/barcodeBeep"
+import { useSearchInput } from "@/composables/useSearchInput"
 
 beforeAll(() => {
 	globalThis.__ = (text, args = []) =>
@@ -243,18 +244,23 @@ describe("scan error under the search bar", () => {
 		})
 	})
 
-	it("stays visible for 5 seconds", async () => {
+	it("stays visible after 5 seconds", async () => {
 		itemStore.searchByBarcode.mockRejectedValue(NOT_FOUND)
 		await scan("999000111")
 
-		await vi.advanceTimersByTimeAsync(SCAN_ERROR_DURATION - 1)
-		expect(api.scanError.value).not.toBeNull()
-		await vi.advanceTimersByTimeAsync(1)
-		expect(api.scanError.value).toBeNull()
-		expect(SCAN_ERROR_DURATION).toBe(5000)
+		await vi.advanceTimersByTimeAsync(5000)
+		expect(api.scanError.value).toMatchObject({ barcode: "999000111" })
 	})
 
-	it("counts repeats of the same barcode instead of stacking, and restarts the 5 seconds", async () => {
+	it("stays visible after 30 seconds", async () => {
+		itemStore.searchByBarcode.mockRejectedValue(NOT_FOUND)
+		await scan("999000111")
+
+		await vi.advanceTimersByTimeAsync(30000)
+		expect(api.scanError.value).toMatchObject({ barcode: "999000111" })
+	})
+
+	it("counts repeats of the same barcode instead of stacking", async () => {
 		itemStore.searchByBarcode.mockRejectedValue(NOT_FOUND)
 		await scan("999000111")
 		await vi.advanceTimersByTimeAsync(4000)
@@ -264,10 +270,6 @@ describe("scan error under the search bar", () => {
 			barcode: "999000111",
 			count: 2,
 		})
-		await vi.advanceTimersByTimeAsync(4000)
-		expect(api.scanError.value).not.toBeNull()
-		await vi.advanceTimersByTimeAsync(1000)
-		expect(api.scanError.value).toBeNull()
 	})
 
 	it("replaces the message when a different barcode fails", async () => {
@@ -355,5 +357,122 @@ describe("scan error under the search bar", () => {
 		expect(onItemFound).toHaveBeenCalledTimes(1)
 		expect(api.scanError.value).toBeNull()
 		expect(searchInput.value).toBe("")
+	})
+})
+
+/** Replaces the browser AudioContext with a stub that records each oscillator it creates. */
+function installFakeAudio(state = "running") {
+	const contexts = []
+	globalThis.AudioContext = class {
+		constructor() {
+			this.state = state
+			this.currentTime = 0
+			this.destination = {}
+			this.oscillators = []
+			contexts.push(this)
+		}
+		createOscillator() {
+			const oscillator = {
+				type: "",
+				frequency: { setValueAtTime: vi.fn() },
+				connect: vi.fn(),
+				start: vi.fn(),
+				stop: vi.fn(),
+			}
+			this.oscillators.push(oscillator)
+			return oscillator
+		}
+		createGain() {
+			return {
+				gain: { setValueAtTime: vi.fn(), exponentialRampToValueAtTime: vi.fn() },
+				connect: vi.fn(),
+			}
+		}
+		resume() {
+			return Promise.resolve()
+		}
+	}
+	return contexts
+}
+
+describe("unknown-barcode beep", () => {
+	let contexts
+
+	const beepCount = () => contexts.flatMap((context) => context.oscillators).length
+
+	beforeEach(() => {
+		vi.useFakeTimers()
+		vi.spyOn(console, "error").mockImplementation(() => {})
+		resetBarcodeBeepForTests()
+		contexts = installFakeAudio("running")
+		mountSearch()
+	})
+
+	afterEach(() => {
+		vi.restoreAllMocks()
+		delete globalThis.AudioContext
+	})
+
+	it("beeps when an unknown barcode is scanned", async () => {
+		itemStore.searchByBarcode.mockRejectedValue(NOT_FOUND)
+
+		await scan("999000111")
+
+		expect(beepCount()).toBe(1)
+		expect(api.scanError.value).toMatchObject({ kind: "not_found" })
+	})
+
+	it("does not beep for a successful scan", async () => {
+		itemStore.searchByBarcode.mockResolvedValue({ item_code: "APPLE" })
+
+		await scan("5012345678900")
+
+		expect(beepCount()).toBe(0)
+		expect(onItemFound).toHaveBeenCalledTimes(1)
+	})
+
+	it("does not beep for a network or server error", async () => {
+		itemStore.searchByBarcode
+			.mockRejectedValueOnce(new TypeError("Failed to fetch"))
+			.mockRejectedValueOnce(
+				Object.assign(new Error("417"), {
+					exc_type: "ValidationError",
+					messages: ["Error searching by barcode: Item SOAP is not allowed for sales"],
+				}),
+			)
+
+		await scan("5012345678900")
+		await scan("5012345678901")
+
+		expect(beepCount()).toBe(0)
+		expect(api.scanError.value).toMatchObject({ kind: "failed" })
+	})
+
+	it("gives one beep for rapid repeated invalid scans, then another after the interval", async () => {
+		itemStore.searchByBarcode.mockRejectedValue(NOT_FOUND)
+
+		for (let i = 0; i < 5; i++) {
+			await scan("999000111")
+		}
+		expect(beepCount()).toBe(1)
+		expect(api.scanError.value).toMatchObject({ count: 5 })
+
+		await vi.advanceTimersByTimeAsync(BEEP_MIN_INTERVAL_MS)
+		await scan("999000111")
+		expect(beepCount()).toBe(2)
+	})
+
+	it("keeps the message when audio is blocked by the browser", async () => {
+		resetBarcodeBeepForTests()
+		contexts = installFakeAudio("suspended")
+		itemStore.searchByBarcode.mockRejectedValue(NOT_FOUND)
+
+		await scan("999000111")
+
+		expect(beepCount()).toBe(0)
+		expect(api.scanError.value).toMatchObject({
+			kind: "not_found",
+			barcode: "999000111",
+		})
 	})
 })

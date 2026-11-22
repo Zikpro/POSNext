@@ -1,9 +1,7 @@
 import { ref, watch, nextTick, onMounted, onUnmounted } from "vue"
 import { QueuedMutex } from "@/utils/mutex"
 import { parseError } from "@/utils/errorHandler"
-
-/** How long the scan error under the search bar stays visible (ms). */
-export const SCAN_ERROR_DURATION = 5000
+import { playBarcodeErrorBeep, unlockBarcodeBeep } from "@/utils/barcodeBeep"
 
 /** exc_type the barcode API raises when no item matches the barcode. */
 const BARCODE_NOT_FOUND = "BarcodeNotFoundError"
@@ -23,9 +21,10 @@ const BARCODE_NOT_FOUND = "BarcodeNotFoundError"
  *   - This guarantees no barcode is ever lost, even when scanning different
  *     items faster than the API can respond (~50 ms between scans).
  *
- * A failed scan sets `scanError`, shown under the search bar for
- * SCAN_ERROR_DURATION. A newer failure replaces it (a repeat of the same one
+ * A failed scan sets `scanError`, shown under the search bar until the next
+ * scan or a dismiss. A newer failure replaces it (a repeat of the same one
  * counts up) and a successful scan clears it, so messages never stack.
+ * An unknown barcode also plays a short beep (throttled in barcodeBeep.js).
  *
  * @param {Object} options
  * @param {Object} options.itemStore          - Pinia item-search store
@@ -43,7 +42,6 @@ export function useSearchInput({ itemStore, onItemFound, isAnyDialogOpen }) {
 
 	// --- Internal (non-reactive) ---
 	let autoSearchTimer = null
-	let scanErrorTimer = null
 	let scanErrorId = 0
 	const barcodeQueue = new QueuedMutex({ timeout: 10000, name: "BarcodeSearch" })
 
@@ -102,10 +100,6 @@ export function useSearchInput({ itemStore, onItemFound, isAnyDialogOpen }) {
 	// ---- Scan error message ----
 
 	function clearScanError() {
-		if (scanErrorTimer) {
-			clearTimeout(scanErrorTimer)
-			scanErrorTimer = null
-		}
 		scanError.value = null
 	}
 
@@ -114,9 +108,6 @@ export function useSearchInput({ itemStore, onItemFound, isAnyDialogOpen }) {
 		const current = scanError.value
 		const isRepeat = current?.kind === kind && current.barcode === barcode && current.reason === reason
 		scanError.value = { id: ++scanErrorId, kind, barcode, reason, count: isRepeat ? current.count + 1 : 1 }
-
-		if (scanErrorTimer) clearTimeout(scanErrorTimer)
-		scanErrorTimer = setTimeout(clearScanError, SCAN_ERROR_DURATION)
 	}
 
 	/** Why a lookup failed, when the barcode was not simply unknown. */
@@ -242,6 +233,7 @@ export function useSearchInput({ itemStore, onItemFound, isAnyDialogOpen }) {
 				// clearSearch() was called before the API request, so
 				// filteredItems would contain ALL cached items (not search results).
 				showScanError("not_found", barcode)
+				playBarcodeErrorBeep()
 			}
 			focusSearchInput()
 		})
@@ -286,7 +278,10 @@ export function useSearchInput({ itemStore, onItemFound, isAnyDialogOpen }) {
 
 	// ---- Global F4 listener ----
 	// Capture phase, so F4 is handled before any focused field sees it
-	onMounted(() => window.addEventListener("keydown", handleGlobalKeyDown, true))
+	onMounted(() => {
+		window.addEventListener("keydown", handleGlobalKeyDown, true)
+		unlockBarcodeBeep()
+	})
 
 	// ---- Cleanup ----
 	function cleanup() {
