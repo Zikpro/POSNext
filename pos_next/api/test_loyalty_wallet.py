@@ -225,10 +225,13 @@ class TestCustomerCreditExcludesWalletRefunds(unittest.TestCase):
 		from pos_next.api import credit_sales
 
 		def get_all(doctype, *args, **kwargs):
-			if doctype == "Sales Invoice":
+			if doctype == "Sales Invoice" and kwargs.get("filters", {}).get("is_return"):
+				# Both returns hold their own credit (update_outstanding_for_self=1), the
+				# returns get_available_credit offers; the wallet refund is subtracted.
+				# (The query for credit held on sale invoices gets nothing here.)
 				return [
-					frappe._dict(name="RET-WALLET", outstanding_amount=-13.47, is_return=1, posting_date=None, grand_total=-13.47, modified=None),
-					frappe._dict(name="RET-CREDIT", outstanding_amount=-6.43, is_return=1, posting_date=None, grand_total=-31.43, modified=None),
+					frappe._dict(name="RET-WALLET", outstanding_amount=-13.47, is_return=1, update_outstanding_for_self=1, posting_date=None, grand_total=-13.47, modified=None),
+					frappe._dict(name="RET-CREDIT", outstanding_amount=-6.43, is_return=1, update_outstanding_for_self=1, posting_date=None, grand_total=-31.43, modified=None),
 				]
 			if doctype == "Wallet Transaction":
 				return [frappe._dict(reference_name="RET-WALLET", amount=13.47)]

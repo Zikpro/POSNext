@@ -1456,6 +1456,14 @@ def submit_invoice(invoice=None, data=None):
         redeemed_customer_credit = data.get("redeemed_customer_credit") or invoice.get("redeemed_customer_credit")
         if redeemed_customer_credit and not invoice_doc.payments:
             invoice_doc.flags.pos_next_redeemed_customer_credit = flt(redeemed_customer_credit)
+        if redeemed_customer_credit:
+            # The credit applied must be fully covered by credit sources, or the sale
+            # would be saved partly unpaid. Checked before anything is saved.
+            from pos_next.api.credit_sales import assert_credit_fully_allocated
+
+            assert_credit_fully_allocated(
+                redeemed_customer_credit, customer_credit_dict, invoice_doc.precision("grand_total")
+            )
 
         # Save before submit
         invoice_doc.flags.ignore_permissions = True
@@ -1472,11 +1480,34 @@ def submit_invoice(invoice=None, data=None):
             requested_refund=requested_refund,
         )
 
+        # "Add to Customer Credit Balance": the return's money part is booked against
+        # the original's current outstanding. What the customer still owes on the
+        # original is settled first; only the excess becomes credit, held on the
+        # return itself so the Credit Balance payment can spend it. Cash and card
+        # refunds are not affected.
+        return_credit_to_original = 0.0
+        if (
+            invoice_doc.get("is_return")
+            and invoice_doc.get("return_against")
+            and invoice.get("add_to_customer_balance")
+        ):
+            from pos_next.api.credit_sales import split_return_credit
+
+            credit_precision = invoice_doc.precision("outstanding_amount")
+            original_outstanding = frappe.db.get_value(
+                "Sales Invoice", invoice_doc.return_against, "outstanding_amount", for_update=True
+            )
+            hold_on_return, return_credit_to_original = split_return_credit(
+                original_outstanding,
+                abs(flt(invoice_doc.grand_total)) - flt(loyalty_share),
+                credit_precision,
+            )
+            invoice_doc.update_outstanding_for_self = 1 if hold_on_return else 0
+
         # Submit invoice
         invoice_doc.submit()
         invoice_submitted = True
         # Handle wallet transaction reversal for returns
-        wallet_reversal_ok = False
         if invoice_doc.get("is_return") and invoice_doc.get("return_against"):
             from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import reverse_wallet_transactions_for_return
             try:
@@ -1484,7 +1515,6 @@ def submit_invoice(invoice=None, data=None):
                     original_invoice=invoice_doc.return_against,
                     return_invoice=invoice_doc.name
                 )
-                wallet_reversal_ok = True
             except Exception as wallet_reversal_error:
                 frappe.log_error(
                     title="Wallet Reversal Error",
@@ -1500,73 +1530,40 @@ def submit_invoice(invoice=None, data=None):
                     indicator="orange"
                 )
 
-        # Credit return amount to customer wallet when "Add to Customer Credit Balance" is enabled.
-        # This is part of the return itself: if the credit cannot be posted, or the
-        # wallet reversal above failed (crediting then could double-credit the
-        # customer), raise so the whole return rolls back and can be retried,
-        # instead of committing a return whose refund went nowhere.
-        if invoice_doc.get("is_return") and invoice.get("add_to_customer_balance"):
-            if invoice_doc.get("return_against") and not wallet_reversal_ok:
-                invoice_submitted = False  # rolled back with the error below
-                frappe.throw(
-                    _("The return could not be credited to the customer wallet because the wallet reversal for {0} failed. Nothing was saved; please retry or contact an administrator.").format(
-                        invoice_doc.return_against
-                    ),
-                    title=_("Wallet Credit Failed"),
-                )
+        # "Add to Customer Credit Balance": settle what the customer still owes on the
+        # original from the return's credit, so only the excess stays as credit. The
+        # amount is capped by the return's actual outstanding after submit. Raising
+        # rolls the whole return back, so a return is never kept half-booked.
+        if return_credit_to_original > 0:
+            from pos_next.api.credit_sales import apply_return_credit_to_original
 
-            from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import credit_return_to_wallet
-
-            # The loyalty share returns as points, so exclude it from the
-            # wallet credit. loyalty_share is 0 for every non-loyalty return,
-            # leaving those unchanged.
-            credit_amount = flt(
-                abs(flt(invoice_doc.grand_total)) - flt(loyalty_share),
-                invoice_doc.precision("grand_total"),
+            return_outstanding = abs(
+                flt(frappe.db.get_value("Sales Invoice", invoice_doc.name, "outstanding_amount"))
             )
-            # A fully loyalty-settled return owes no money, so there is nothing
-            # to credit. The call is skipped rather than made with 0 -
-            # credit_return_to_wallet() would read a falsy amount as "not
-            # supplied" and credit the full grand_total.
-            if credit_amount > 0:
-                try:
-                    credited = credit_return_to_wallet(
-                        return_invoice=invoice_doc.name, amount=credit_amount
-                    )
-                except Exception:
-                    invoice_submitted = False  # the return rolls back with this error
-                    raise
-            else:
-                credited = True
-            if not credited:
-                invoice_submitted = False  # rolled back with the error below
-                frappe.throw(
-                    _("{0} could not be credited to the customer wallet for return {1}. Nothing was saved; check the wallet account settings and retry.").format(
-                        frappe.format_value(credit_amount, {"fieldtype": "Currency"}), invoice_doc.name
-                    ),
-                    title=_("Wallet Credit Failed"),
+            try:
+                apply_return_credit_to_original(
+                    invoice_doc, min(return_credit_to_original, return_outstanding)
                 )
+            except Exception:
+                invoice_submitted = False  # the return rolls back with this error
+                raise
+
+        # Apply customer credit to the submitted sale. All or nothing: if the credit
+        # cannot be applied (spent meanwhile at another till, a journal entry fails),
+        # raising rolls the whole sale back, instead of keeping it unpaid. Done before
+        # the offline sync record is completed, so that is only marked done on success.
+        if redeemed_customer_credit and customer_credit_dict:
+            from pos_next.api.credit_sales import redeem_customer_credit
+
+            try:
+                redeem_customer_credit(invoice_doc.name, customer_credit_dict)
+            except Exception:
+                invoice_submitted = False  # the sale rolls back with this error
+                raise
 
         # Complete the offline sync record
         if sync_record_name:
             _complete_offline_sync(sync_record_name, invoice_doc.name)
-
-        # Handle credit redemption after successful submission
-        if redeemed_customer_credit and customer_credit_dict:
-            try:
-                from pos_next.api.credit_sales import redeem_customer_credit
-                redeem_customer_credit(invoice_doc.name, customer_credit_dict)
-            except Exception as credit_error:
-                frappe.log_error(
-                    title="Credit Redemption Error",
-                    message=f"Invoice: {invoice_doc.name}, Error: {str(credit_error)}\n{frappe.get_traceback()}"
-                )
-                # Don't fail the entire transaction, just log the error
-                frappe.msgprint(
-                    _("Invoice submitted successfully but credit redemption failed. Please contact administrator."),
-                    alert=True,
-                    indicator="orange"
-                )
 
         # Log manual rate edits for audit trail (only after successful submission)
         if doctype == DOCTYPE_SALES_INVOICE:

@@ -128,6 +128,12 @@ def before_cancel(doc, method=None):
 		doc: Sales Invoice document
 		method: Hook method name (unused)
 	"""
+	# Checked first, before anything is cancelled: an invoice whose customer credit
+	# paid another sale cannot be cancelled until that sale is cancelled.
+	from pos_next.api.credit_sales import assert_credit_not_spent
+
+	assert_credit_not_spent(doc.name)
+
 	# Not swallowed: if these cannot be cancelled the invoice must not be
 	# cancelled either, or the wallet would keep a credit for a voided sale.
 	from pos_next.pos_next.doctype.wallet_transaction.wallet_transaction import (
@@ -135,6 +141,14 @@ def before_cancel(doc, method=None):
 	)
 
 	cancel_loyalty_wallet_transactions(doc)
+
+	# A return credited to the customer may have settled its original's unpaid
+	# amount with a journal entry. Cancelled first, and not swallowed: the journal
+	# links to the return, so the return cannot be cancelled while it stands.
+	if doc.get("is_return"):
+		from pos_next.api.credit_sales import cancel_return_credit_settlement
+
+		cancel_return_credit_settlement(doc.name)
 
 	try:
 		from pos_next.api.credit_sales import cancel_credit_journal_entries
