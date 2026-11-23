@@ -413,6 +413,28 @@ class CustomSalesInvoice(SalesInvoice):
 
 			sync_loyalty_wallet_credit(self.return_against)
 
+	def get_gl_entries(self, inventory_account_map=None):
+		"""Keep every Debtors row of a credit-holding return on the return itself.
+
+		A return with update_outstanding_for_self = 1 holds its own credit (customer
+		credit, see credit_sales.split_return_credit). ERPNext books its main Debtors
+		row against the return, but make_write_off_gl_entry() always books against
+		the original invoice, ignoring that flag. On a return that restores loyalty
+		points the write-off is the loyalty share, so the original would show it as
+		owed and the return would hold too much credit. Only rows on the customer's
+		Debtors account that point at the original are moved; nothing else changes.
+		"""
+		gl_entries = super().get_gl_entries(inventory_account_map)
+		if self.is_return and self.return_against and cint(self.update_outstanding_for_self):
+			for entry in gl_entries:
+				if (
+					entry.get("account") == self.debit_to
+					and entry.get("party") == self.customer
+					and entry.get("against_voucher") == self.return_against
+				):
+					entry["against_voucher"] = self.name
+		return gl_entries
+
 	def make_pos_gl_entries(self, gl_entries):
 		"""
 		Override to add party information for wallet payment accounts.
