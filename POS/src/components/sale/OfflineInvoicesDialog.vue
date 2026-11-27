@@ -69,6 +69,12 @@
 										{{ __('Printed') }}
 									</span>
 								</div>
+								<p
+									v-if="invoice.retry_count > 0 && invoice.error"
+									class="mt-1 text-xs text-red-700 break-words"
+								>
+									{{ __('Not synced: {0}', [plainText(invoice.error)]) }}
+								</p>
 								<div class="mt-2 flex flex-col gap-1 text-xs sm:text-sm text-gray-600">
 									<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
 										<span>{{ __('{0} items', [invoice.data.items?.length || 0]) }}</span>
@@ -315,6 +321,16 @@ async function loadInvoices() {
 
 function formatCurrency(amount) {
 	return formatCurrencyUtil(amount, props.currency)
+}
+
+/**
+ * A server error message as plain text (server messages may contain HTML tags).
+ * DOMParser builds an inert document: nothing in the message runs or loads.
+ */
+function plainText(message) {
+	const html = String(message || "").replace(/<br\s*\/?>/gi, " ")
+	const parsed = new DOMParser().parseFromString(html, "text/html")
+	return (parsed.body.textContent || "").replace(/\s+/g, " ").trim()
 }
 
 function formatDate(timestamp) {

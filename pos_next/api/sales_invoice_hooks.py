@@ -16,6 +16,8 @@ def validate(doc, method=None):
 	Validate hook for Sales Invoice.
 	Apply tax inclusive settings based on POS Profile configuration.
 	Auto-assign loyalty program to customer if enabled.
+	Enforce the user's till powers (POS Role Rule) on POS sales, so no path,
+	including a direct API call, can give a discount or price change beyond them.
 
 	Args:
 		doc: Sales Invoice document
@@ -23,6 +25,10 @@ def validate(doc, method=None):
 	"""
 	apply_tax_inclusive(doc)
 	auto_assign_loyalty_program_on_invoice(doc)
+
+	from pos_next.api.discount_rules import enforce_till_rules
+
+	enforce_till_rules(doc)
 
 
 def apply_tax_inclusive(doc):

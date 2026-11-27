@@ -9,6 +9,22 @@ import { offlineState } from './offlineState'
 
 const log = logger.create('OfflineWorker')
 
+/**
+ * Record who rang up a sale saved offline, from the login cookie (the worker cannot
+ * read cookies). When it syncs, the server checks the sale against this user's till
+ * powers as well as the syncing user's, whichever allows less
+ * (pos_next.api.discount_rules), so a value changed on the device cannot add powers.
+ * @param {Object} invoiceData
+ * @returns {Object} the invoice data with pos_next_rung_up_by set
+ */
+export function stampRungUpBy(invoiceData) {
+	if (!invoiceData || invoiceData.pos_next_rung_up_by) return invoiceData
+	const cookies = new URLSearchParams((globalThis.document?.cookie || "").split("; ").join("&"))
+	const user = cookies.get("user_id")
+	if (!user || user === "Guest") return invoiceData
+	return { ...invoiceData, pos_next_rung_up_by: user }
+}
+
 class OfflineWorkerClient {
 	constructor() {
 		this.worker = null
@@ -403,7 +419,7 @@ class OfflineWorkerClient {
 	}
 
 	async saveOfflineInvoice(invoiceData) {
-		return this.sendMessage("SAVE_INVOICE", { invoiceData })
+		return this.sendMessage("SAVE_INVOICE", { invoiceData: stampRungUpBy(invoiceData) })
 	}
 
 	async searchCachedItems(searchTerm = "", limit = 50, offset = 0) {

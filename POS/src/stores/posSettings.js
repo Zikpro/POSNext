@@ -3,6 +3,23 @@ import { defineStore } from "pinia"
 import { computed, ref } from "vue"
 import { useBootstrapStore } from "./bootstrap"
 
+/**
+ * The logged-in user's till powers, set per role in POS Role Rule and worked out on
+ * the server (pos_next.api.role_rules). They arrive with the settings; these defaults
+ * match the POS Settings defaults (no discount limit) until the server answers.
+ * max_discount_percent only applies when allow_any_discount is 0; 0 = no discount.
+ */
+const ROLE_RULE_DEFAULTS = Object.freeze({
+	allow_any_discount: 1,
+	max_discount_percent: 0,
+	allow_item_discount: 1,
+	allow_additional_discount: 0,
+	allow_rate_edit: 0,
+	allow_return_without_receipt: 0,
+	allow_award_loyalty_points: 0,
+	role_rules_source: "pos_settings",
+})
+
 export const usePOSSettingsStore = defineStore("posSettings", () => {
 	// State
 	const settings = ref({
@@ -68,6 +85,8 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		// Security
 		enable_session_lock: 0,
 		session_lock_timeout: 5,
+		// The user's till powers (POS Role Rule)
+		...ROLE_RULE_DEFAULTS,
 	})
 
 	const isLoading = ref(false)
@@ -243,6 +262,30 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		() => Number.parseInt(settings.value.session_lock_timeout) || 5,
 	)
 
+	// Computed - The user's till powers (POS Role Rule)
+	const allowAnyDiscount = computed(() =>
+		Boolean(Number(settings.value.allow_any_discount)),
+	)
+	const maxDiscountPercent = computed(
+		() => Number.parseFloat(settings.value.max_discount_percent) || 0,
+	)
+	/** Highest discount % the user may give, or null when any discount is allowed. */
+	const discountLimit = computed(() =>
+		allowAnyDiscount.value ? null : maxDiscountPercent.value,
+	)
+	const allowRateEdit = computed(() =>
+		Boolean(Number(settings.value.allow_rate_edit)),
+	)
+	const allowReturnWithoutReceipt = computed(() =>
+		Boolean(Number(settings.value.allow_return_without_receipt)),
+	)
+	const allowAwardLoyaltyPoints = computed(() =>
+		Boolean(Number(settings.value.allow_award_loyalty_points)),
+	)
+	const roleRulesSource = computed(
+		() => settings.value.role_rules_source || "pos_settings",
+	)
+
 	// Resource
 	const settingsResource = createResource({
 		url: "pos_next.pos_next.doctype.pos_settings.pos_settings.get_pos_settings",
@@ -259,7 +302,26 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 	})
 
 	// Actions
-	async function loadSettings(posProfile) {
+
+	/** Settings preloaded by bootstrap, or null. */
+	function getPreloadedSettings() {
+		try {
+			const preloaded = useBootstrapStore().getPreloadedPOSSettings()
+			return preloaded && Object.keys(preloaded).length > 0 ? preloaded : null
+		} catch {
+			// Bootstrap store may not be available
+			return null
+		}
+	}
+
+	/**
+	 * Load the settings, with the logged-in user's till powers, for a POS Profile.
+	 * @param {string} posProfile
+	 * @param {{fresh?: boolean}} [options] fresh: ask the server even when bootstrap
+	 *   preloaded the settings (used when a shift opens, so the rules are current).
+	 *   If the server cannot be reached, the preloaded settings are used.
+	 */
+	async function loadSettings(posProfile, { fresh = false } = {}) {
 		if (!posProfile) {
 			return false
 		}
@@ -267,25 +329,26 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		isLoading.value = true
 		settings.value.pos_profile = posProfile
 
-		// OPTIMIZATION: Check if bootstrap has preloaded the settings
+		const preloaded = getPreloadedSettings()
+		// OPTIMIZATION: use the settings bootstrap preloaded, unless asked for fresh ones
+		if (preloaded && !fresh) {
+			Object.assign(settings.value, preloaded)
+			isLoaded.value = true
+			isLoading.value = false
+			return true
+		}
+
 		try {
-			const bootstrapStore = useBootstrapStore()
-			const preloadedSettings = bootstrapStore.getPreloadedPOSSettings()
-			if (preloadedSettings && Object.keys(preloadedSettings).length > 0) {
-				Object.assign(settings.value, preloadedSettings)
+			await settingsResource.submit({ pos_profile: posProfile, for_till: 1 })
+			return true
+		} catch {
+			if (preloaded) {
+				// Offline or server error: keep working with the preloaded settings
+				Object.assign(settings.value, preloaded)
 				isLoaded.value = true
 				isLoading.value = false
 				return true
 			}
-		} catch {
-			// Bootstrap store may not be available, fall through to API call
-		}
-
-		// Fallback to API call
-		try {
-			await settingsResource.submit({ pos_profile: posProfile })
-			return true
-		} catch {
 			return false
 		}
 	}
@@ -345,6 +408,8 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 			// Security
 			enable_session_lock: 0,
 			session_lock_timeout: 5,
+			// The user's till powers (POS Role Rule)
+			...ROLE_RULE_DEFAULTS,
 		}
 		isLoaded.value = false
 	}
@@ -391,8 +456,8 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		isLoading.value = true
 
 		try {
-			// Use submit with pos_profile to ensure proper reload
-			await settingsResource.submit({ pos_profile: settings.value.pos_profile })
+			// Use submit with pos_profile to ensure proper reload (with the user's till powers)
+			await settingsResource.submit({ pos_profile: settings.value.pos_profile, for_till: 1 })
 			return true
 		} catch {
 			return false
@@ -480,6 +545,15 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		// Computed - Security
 		enableSessionLock,
 		sessionLockTimeout,
+
+		// Computed - The user's till powers (POS Role Rule)
+		allowAnyDiscount,
+		maxDiscountPercent,
+		discountLimit,
+		allowRateEdit,
+		allowReturnWithoutReceipt,
+		allowAwardLoyaltyPoints,
+		roleRulesSource,
 
 		// Actions
 		loadSettings,

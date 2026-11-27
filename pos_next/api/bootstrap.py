@@ -206,6 +206,8 @@ def _get_pos_settings(pos_profile_doc):
 	Returns:
 		dict: POS Settings with derived values
 	"""
+	from pos_next.api.role_rules import apply_rules_to_settings
+
 	try:
 		settings = frappe.db.get_value(
 			"POS Settings",
@@ -219,11 +221,13 @@ def _get_pos_settings(pos_profile_doc):
 			pos_profile_doc.write_off_account and (pos_profile_doc.write_off_limit or 0) > 0
 		) else 0
 		settings["disable_rounded_total"] = pos_profile_doc.disable_rounded_total or 0
-
-		return settings
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Get POS Settings Error")
-		return DEFAULT_POS_SETTINGS.copy()
+		settings = DEFAULT_POS_SETTINGS.copy()
+
+	# The logged-in user's till powers (POS Role Rule). Outside the try on purpose:
+	# a failure here must not hand out default powers.
+	return apply_rules_to_settings(settings, pos_profile_doc.name)
 
 
 def _get_payment_methods(pos_profile_name):

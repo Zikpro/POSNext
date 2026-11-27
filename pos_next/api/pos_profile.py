@@ -69,8 +69,9 @@ def get_pos_profile_data(pos_profile):
 
 @frappe.whitelist()
 def get_pos_settings(pos_profile):
-	"""Get POS Settings for a given POS Profile"""
+	"""Get POS Settings for a given POS Profile, with the session user's till powers."""
 	from pos_next.api.constants import POS_SETTINGS_FIELDS, DEFAULT_POS_SETTINGS
+	from pos_next.api.role_rules import apply_rules_to_settings
 
 	if not pos_profile:
 		return DEFAULT_POS_SETTINGS.copy()
@@ -82,15 +83,13 @@ def get_pos_settings(pos_profile):
 			{"pos_profile": pos_profile, "enabled": 1},
 			POS_SETTINGS_FIELDS,
 			as_dict=True
-		)
-
-		if not pos_settings:
-			return DEFAULT_POS_SETTINGS.copy()
-
-		return pos_settings
+		) or DEFAULT_POS_SETTINGS.copy()
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Get POS Settings Error")
-		return DEFAULT_POS_SETTINGS.copy()
+		pos_settings = DEFAULT_POS_SETTINGS.copy()
+
+	# Outside the try on purpose: a failure here must not hand out default powers.
+	return apply_rules_to_settings(pos_settings, pos_profile)
 
 
 @frappe.whitelist()

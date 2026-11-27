@@ -20,9 +20,20 @@
 
 				<!-- Recent Invoices List -->
 				<div>
-					<label class="block text-sm text-start font-medium text-gray-700 mb-3">
-						{{ __('Select Invoice to Return') }}
-					</label>
+					<div class="flex items-center justify-between gap-2 mb-3">
+						<label class="block text-sm text-start font-medium text-gray-700">
+							{{ __('Select Invoice to Return') }}
+						</label>
+						<!-- Only for users whose till rules allow it (POS Role Rule) -->
+						<Button
+							v-if="settingsStore.allowReturnWithoutReceipt && !isOffline"
+							variant="subtle"
+							size="sm"
+							@click="openNoReceiptRefund"
+						>
+							{{ __('Refund without receipt') }}
+						</Button>
+					</div>
 
 					<!-- Smart Search Input with Autocomplete -->
 					<div class="mb-3 flex gap-2">
@@ -775,12 +786,22 @@
 			</div>
 		</template>
 	</Dialog>
+
+	<NoReceiptRefundDialog
+		v-model="showNoReceiptRefund"
+		:pos-profile="posProfile"
+		:pos-opening-shift="posOpeningShift"
+		:currency="currency"
+		@refund-created="(refund) => emit('return-created', refund)"
+	/>
 </template>
 
 <script setup>
 import { useOfflineStatus } from "@/composables/useOfflineStatus"
 import { useToast } from "@/composables/useToast"
 import { getPaymentIcon } from "@/utils/payment"
+import { usePOSSettingsStore } from "@/stores/posSettings"
+import NoReceiptRefundDialog from "@/components/sale/NoReceiptRefundDialog.vue"
 import {
 	DEFAULT_CURRENCY,
 	DEFAULT_LOCALE,
@@ -820,6 +841,14 @@ const showDialog = computed({
 	get: () => props.modelValue,
 	set: (val) => emit("update:modelValue", val),
 })
+
+// Refund without receipt (POS Role Rule "Refund Without Receipt")
+const settingsStore = usePOSSettingsStore()
+const showNoReceiptRefund = ref(false)
+function openNoReceiptRefund() {
+	showDialog.value = false
+	showNoReceiptRefund.value = true
+}
 
 // State
 const originalInvoice = ref(null)

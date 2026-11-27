@@ -427,6 +427,9 @@
 											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/>
 										</svg>
 										<span class="text-xs font-medium text-orange-700">{{ __('Additional Discount') }}</span>
+										<span v-if="settingsStore.discountLimit !== null" class="text-xs text-gray-500">
+											{{ __('Your limit: {0}%', [settingsStore.discountLimit]) }}
+										</span>
 									</div>
 									<span v-if="localAdditionalDiscount > 0" class="text-xs font-bold text-red-600">
 										-{{ formatCurrency(calculatedAdditionalDiscount) }}
@@ -453,7 +456,7 @@
 											@input="handleAdditionalDiscountChange"
 											:placeholder="additionalDiscountType === 'percentage' ? '0' : '0.00'"
 											min="0"
-											:max="additionalDiscountType === 'percentage' ? 100 : subtotal"
+											:max="additionalDiscountType === 'percentage' ? (settingsStore.discountLimit ?? 100) : maxAdditionalDiscount"
 											step="1"
 											class="flex-1 h-9 px-1 text-sm font-semibold text-center bg-transparent border-none focus:outline-none focus:ring-0 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
 										/>
@@ -1078,11 +1081,13 @@
 import { usePOSSettingsStore } from "@/stores/posSettings"
 import {
 	DEFAULT_CURRENCY,
+	floorCurrency,
 	formatCurrency as formatCurrencyUtil,
 	getCurrencySymbol,
 	roundCurrency,
 } from "@/utils/currency"
 import { getPaymentIcon } from "@/utils/payment"
+import { maxDiscountAmount } from "@/utils/discountLimit"
 import { offlineWorker } from "@/utils/offline/workerClient"
 import { logger } from "@/utils/logger"
 import { Dialog, createResource, call } from "frappe-ui"
@@ -2702,26 +2707,30 @@ function getMethodTotal(methodName) {
 		.reduce((sum, entry) => sum + (entry.amount || 0), 0)
 }
 
+// The most the whole-sale discount may take off: the user's limit (POS Role Rule, or
+// POS Settings) as a percent of the subtotal; the whole subtotal when any discount is allowed
+const maxAdditionalDiscount = computed(() =>
+	maxDiscountAmount({
+		originalTotal: props.subtotal,
+		subtotal: props.subtotal,
+		limit: settingsStore.discountLimit,
+	}),
+)
+
 // Additional discount handlers
 function handleAdditionalDiscountChange() {
 	let discountValue = localAdditionalDiscount.value
 	let discountAmount = 0
+	const limit = settingsStore.discountLimit
 
 	// If percentage mode, calculate amount
 	if (additionalDiscountType.value === "percentage") {
-		// Validate against max_discount_allowed if configured
-		if (
-			settingsStore.maxDiscountAllowed > 0 &&
-			discountValue > settingsStore.maxDiscountAllowed
-		) {
-			localAdditionalDiscount.value = settingsStore.maxDiscountAllowed
-			discountValue = settingsStore.maxDiscountAllowed
+		// Cap at the user's discount limit
+		if (limit !== null && discountValue > limit) {
+			localAdditionalDiscount.value = limit
+			discountValue = limit
 			// Show warning toast
-			showWarning(
-				__("Maximum allowed discount is {0}%", [
-					settingsStore.maxDiscountAllowed,
-				]),
-			)
+			showWarning(__("Maximum allowed discount is {0}%", [limit]))
 		}
 
 		// Ensure percentage is between 0-100
@@ -2730,29 +2739,25 @@ function handleAdditionalDiscountChange() {
 			discountValue = 100
 		}
 
-		// Convert percentage to amount
-		discountAmount = (props.subtotal * discountValue) / 100
+		// Convert percentage to amount, rounded DOWN so it is never over the percent entered
+		discountAmount = floorCurrency((props.subtotal * discountValue) / 100)
 	} else {
 		// Amount mode
 		discountAmount = discountValue
 
-		// For amount mode, check if it exceeds percentage limit when converted
-		if (settingsStore.maxDiscountAllowed > 0 && props.subtotal > 0) {
-			const percentageEquivalent = (discountAmount / props.subtotal) * 100
-			if (percentageEquivalent > settingsStore.maxDiscountAllowed) {
-				const maxAmount =
-					(props.subtotal * settingsStore.maxDiscountAllowed) / 100
-				localAdditionalDiscount.value = maxAmount
-				discountAmount = maxAmount
-				// Show warning toast
-				showWarning(
-					__("Maximum allowed discount is {0}% ({1} {2})", [
-						settingsStore.maxDiscountAllowed,
-						props.currency,
-						maxAmount.toFixed(2),
-					]),
-				)
-			}
+		// For amount mode, cap at the user's limit converted to money
+		if (limit !== null && props.subtotal > 0 && discountAmount > maxAdditionalDiscount.value) {
+			const maxAmount = maxAdditionalDiscount.value
+			localAdditionalDiscount.value = maxAmount
+			discountAmount = maxAmount
+			// Show warning toast
+			showWarning(
+				__("Maximum allowed discount is {0}% ({1} {2})", [
+					limit,
+					props.currency,
+					maxAmount.toFixed(2),
+				]),
+			)
 		}
 	}
 

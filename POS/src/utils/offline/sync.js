@@ -258,11 +258,12 @@ const markInvoiceSynced = async (id, serverInvoice, offlineId) => {
  */
 const handleSyncFailure = async (invoice, errorMessage) => {
 	const newRetryCount = (invoice.retry_count || 0) + 1
-	const updates = { retry_count: newRetryCount }
+	// The reason is kept from the first failure, so the offline queue can show why a
+	// sale did not sync (for example a discount above the user's limit).
+	const updates = { retry_count: newRetryCount, error: errorMessage }
 
 	if (newRetryCount >= SYNC_CONFIG.MAX_RETRY_COUNT) {
 		updates.sync_failed = true
-		updates.error = errorMessage
 	}
 
 	await db.invoice_queue.update(invoice.id, updates)

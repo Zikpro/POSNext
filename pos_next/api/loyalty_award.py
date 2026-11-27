@@ -1,7 +1,7 @@
 """Manually awarding loyalty points, for goodwill (a complaint, an apology).
 
 ERPNext only creates Loyalty Point Entries from invoices, and no role may create one
-by hand. This lets a manager add points with a reason. The points are
+by hand. This lets a user whose POS Role Rule allows it add points with a reason. The points are
 ordinary ERPNext points: they count in the customer's balance and are spent at the
 till through Redeem Points like earned points. Nothing is posted to the accounts when
 points are awarded; ERPNext posts the loyalty expense when they are redeemed.
@@ -11,27 +11,35 @@ import frappe
 from frappe import _
 from frappe.utils import add_days, cint, flt, today
 
-MANAGER_ROLES = ("Nexus POS Manager", "System Manager")
 REASON_PREFIX = "Manual award: "
 # Loyalty Point Entry.discretionary_reason is a Data field (140 characters).
 MAX_REASON_LENGTH = 140 - len(REASON_PREFIX)
 
 
 def can_award_points(user=None):
-	"""Whether the user may award loyalty points."""
-	return bool(set(MANAGER_ROLES) & set(frappe.get_roles(user)))
+	"""Whether the user may award loyalty points: POS Role Rule "Award Loyalty Points"
+	(System Manager always may)."""
+	from pos_next.api.role_rules import can_award_loyalty_points
+
+	return can_award_loyalty_points(user)
+
+
+@frappe.whitelist()
+def can_award():
+	"""For the Customer form: show "Award Loyalty Points" only to users who may use it."""
+	return can_award_points()
 
 
 @frappe.whitelist()
 def award_loyalty_points(customer, points, reason):
 	"""Add loyalty points to a customer's balance.
 
-	Manager only. The customer must be enrolled in a Loyalty Program, the points must
+	Only for users whose POS Role Rule allows it. The customer must be enrolled in a Loyalty Program, the points must
 	be a positive whole number, and a reason is required. Points can only be added.
 	Returns the customer's new balance.
 	"""
 	if not can_award_points():
-		frappe.throw(_("Only a POS manager can award loyalty points."), frappe.PermissionError)
+		frappe.throw(_("You are not allowed to award loyalty points."), frappe.PermissionError)
 
 	if not customer or not frappe.db.exists("Customer", customer):
 		frappe.throw(_("Customer {0} not found").format(customer))

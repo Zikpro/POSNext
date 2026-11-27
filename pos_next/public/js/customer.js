@@ -1,13 +1,17 @@
-// "Award Loyalty Points" on the Customer form, for POS managers.
-// The server (pos_next.api.loyalty_award) checks the role and validates everything;
-// the button is only hidden from users who could not use it.
+// "Award Loyalty Points" on the Customer form, for users whose POS Role Rule allows it.
+// The server (pos_next.api.loyalty_award) decides who may award and validates
+// everything; the button is only hidden from users who could not use it.
 
-const POS_NEXT_POINT_MANAGER_ROLES = ["Nexus POS Manager", "System Manager"];
+let pos_next_can_award_points; // asked once per page load
 
 frappe.ui.form.on("Customer", {
-	refresh(frm) {
+	async refresh(frm) {
 		if (frm.is_new() || !frm.doc.loyalty_program) return;
-		if (!POS_NEXT_POINT_MANAGER_ROLES.some((role) => frappe.user.has_role(role))) return;
+		if (pos_next_can_award_points === undefined) {
+			const r = await frappe.call({ method: "pos_next.api.loyalty_award.can_award" });
+			pos_next_can_award_points = Boolean(r && r.message);
+		}
+		if (!pos_next_can_award_points) return;
 
 		frm.add_custom_button(__("Award Loyalty Points"), () => pos_next_award_points(frm));
 	},

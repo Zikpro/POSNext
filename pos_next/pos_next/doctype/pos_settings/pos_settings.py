@@ -83,13 +83,17 @@ class POSSettings(Document):
 
 
 @frappe.whitelist()
-def get_pos_settings(pos_profile):
+def get_pos_settings(pos_profile, for_till=0):
 	"""
 	Get POS Settings for a specific POS Profile.
 
 	Also injects the current global Stock Settings value to show the actual
 	source of truth, preventing confusion when the checkbox appears enabled
 	but the global setting was changed elsewhere.
+
+	for_till=1 (the till) also adds the session user's till powers from POS Role
+	Rule. The POS Settings editor leaves it off, so it always shows and saves the
+	profile's own values, never one user's rules.
 	"""
 	from frappe import _
 
@@ -121,6 +125,11 @@ def get_pos_settings(pos_profile):
 	settings["_global_allow_negative_stock"] = cint(
 		frappe.db.get_single_value("Stock Settings", "allow_negative_stock") or 0
 	)
+
+	if cint(for_till):
+		from pos_next.api.role_rules import apply_rules_to_settings
+
+		apply_rules_to_settings(settings, pos_profile)
 
 	return settings
 

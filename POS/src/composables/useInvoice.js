@@ -4,7 +4,7 @@ import { isOffline, getCachedItem } from "@/utils/offline"
 import { useSerialNumberStore } from "@/stores/serialNumber"
 import { CoalescingMutex } from "@/utils/mutex"
 import { logger } from "@/utils/logger"
-import { roundCurrency } from "@/utils/currency"
+import { ceilCurrency, roundCurrency } from "@/utils/currency"
 
 const log = logger.create("Invoice")
 
@@ -668,17 +668,28 @@ export function useInvoice() {
 		const roundedRate = roundCurrency(effectiveRate)
 		const baseAmount = roundCurrency(item.quantity * roundedRate)
 
-		// Calculate discount from either percentage or fixed amount
+		// Calculate discount from either percentage or fixed amount. The discounted unit
+		// price is rounded UP to the penny, so the discount given is never more than
+		// the one entered (10% off 4.49 is 4.05, not 4.04 = 10.02%), and the line
+		// amounts follow from that price, exactly as the server records them.
 		let discountAmount = 0
-		if (item.discount_percentage > 0) {
-			discountAmount = roundCurrency(
-				(baseAmount * item.discount_percentage) / 100,
-			)
-		} else if (item.discount_amount > 0) {
-			discountAmount = roundCurrency(item.discount_amount)
-			// Sync percentage when amount is provided directly
-			item.discount_percentage =
-				baseAmount > 0 ? (discountAmount / baseAmount) * 100 : 0
+		let perUnitDiscount = 0
+		const byPercentage = item.discount_percentage > 0
+		if (byPercentage) {
+			perUnitDiscount = (roundedRate * item.discount_percentage) / 100
+		} else if (item.discount_amount > 0 && item.quantity > 0) {
+			perUnitDiscount = item.discount_amount / item.quantity
+		}
+		item.discounted_rate = undefined
+		if (perUnitDiscount > 0) {
+			const discountedRate = Math.max(0, ceilCurrency(roundedRate - perUnitDiscount))
+			item.discounted_rate = discountedRate
+			discountAmount = roundCurrency(baseAmount - roundCurrency(discountedRate * item.quantity))
+			if (!byPercentage) {
+				// Sync percentage when amount is provided directly
+				item.discount_percentage =
+					baseAmount > 0 ? (discountAmount / baseAmount) * 100 : 0
+			}
 		}
 		item.discount_amount = discountAmount
 
@@ -718,6 +729,13 @@ export function useInvoice() {
 		const qty = item.quantity || item.qty || 1
 		const priceListRate = item.price_list_rate || item.rate || 0
 		const discountAmount = item.discount_amount || 0
+
+		// A discounted item: send the unit price recalculateItem() rounded up, in both
+		// tax modes (gross and net rate are the same unit price here), so the server
+		// records exactly the discount the cart shows - never a penny more.
+		if (item.discounted_rate !== undefined && item.discounted_rate !== null) {
+			return item.discounted_rate
+		}
 
 		if (taxInclusive.value) {
 			// Gross rate: price minus per-unit discount

@@ -1789,8 +1789,9 @@ async function handleShiftOpened() {
 		stockStore.setWarehouse(shiftStore.profileWarehouse);
 	}
 
-	// Mirror initPOS: fire independent operations in parallel while settings load
-	const settingsPromise = posSettingsStore.loadSettings(shiftStore.profileName);
+	// Mirror initPOS: fire independent operations in parallel while settings load.
+	// fresh: re-read the user's till powers (POS Role Rule) when a shift opens.
+	const settingsPromise = posSettingsStore.loadSettings(shiftStore.profileName, { fresh: true });
 
 	const backgroundOps = Promise.allSettled([
 		cartStore.setDefaultCustomer(),
@@ -1816,8 +1817,6 @@ async function handleShiftOpened() {
 
 	// Load tax rules (depends on settings being loaded)
 	await cartStore.loadTaxRules(shiftStore.profileName, posSettingsStore.settings);
-
-	_initializedProfile = shiftStore.profileName;
 
 	// Start session lock tracking now that a shift is open and POS is ready
 	startActivityTracking();

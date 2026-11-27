@@ -203,6 +203,24 @@ export function roundCurrency(value) {
 	return round(value, settings.currency)
 }
 
+// The float error of a computed amount (e.g. 4.49 * 0.9 = 4.041000000000001) is
+// removed before rounding up or down, so it cannot move an exact amount a whole unit.
+function _scaled(value, precision) {
+	return Number((Number(value || 0) * 10 ** precision).toFixed(6))
+}
+
+/** Round UP to currency precision: a discounted price never gives more discount than allowed */
+export function ceilCurrency(value) {
+	const p = settings.currency
+	return Math.ceil(_scaled(value, p)) / 10 ** p
+}
+
+/** Round DOWN to currency precision: a discount amount never goes above what is allowed */
+export function floorCurrency(value) {
+	const p = settings.currency
+	return Math.floor(_scaled(value, p)) / 10 ** p
+}
+
 /** Round using system float precision */
 export function roundFloat(value) {
 	return round(value, settings.float)

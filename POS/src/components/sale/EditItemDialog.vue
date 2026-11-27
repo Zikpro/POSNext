@@ -210,7 +210,12 @@
 
 											<!-- Item Discount Section (only if allowed by POS Profile) -->
 											<div v-if="settingsStore.allowItemDiscount" class="border-t border-gray-200 pt-4">
-												<label class="block text-sm font-medium text-gray-700 mb-3 text-start">{{ __('Item Discount') }}</label>
+												<div class="flex items-center justify-between gap-2 mb-3">
+													<label class="block text-sm font-medium text-gray-700 text-start">{{ __('Item Discount') }}</label>
+													<span v-if="discountLimit !== null" class="text-xs font-medium text-gray-500">
+														{{ __('Your limit: {0}%', [discountLimit]) }}
+													</span>
+												</div>
 												<div class="grid grid-cols-2 gap-3">
 													<!-- Discount Type -->
 													<div>
@@ -225,10 +230,10 @@
 																v-model.number="discountValue"
 																type="number"
 																min="0"
-																:max="discountType === 'percentage' ? 100 : undefined"
+																:max="discountType === 'percentage' ? maxDiscountPercentNow : maxItemDiscount"
 																step="0.01"
 																class="w-full h-7 border border-gray-300 rounded-lg px-3 pe-8 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-																@input="calculateDiscount"
+																@input="calculateDiscount(true)"
 															/>
 															<span class="absolute inset-y-0 end-0 pe-3 flex items-center text-gray-500 text-sm">
 																{{ discountType === 'percentage' ? '%' : '' }}
@@ -286,7 +291,8 @@ import { useToast } from "@/composables/useToast"
 import { usePOSSettingsStore } from "@/stores/posSettings"
 import { useSerialNumberStore } from "@/stores/serialNumber"
 import { getItemStock } from "@/utils/stockValidator"
-import { formatCurrency as formatCurrencyUtil, getCurrencySymbol, roundCurrency } from "@/utils/currency"
+import { ceilCurrency, formatCurrency as formatCurrencyUtil, getCurrencySymbol, roundCurrency } from "@/utils/currency"
+import { discountPercent, isWithinLimit, maxDiscountAmount } from "@/utils/discountLimit"
 import { Button, FeatherIcon, createResource } from "frappe-ui"
 import { computed, ref, watch } from "vue"
 import SelectInput from "@/components/common/SelectInput.vue"
@@ -329,6 +335,31 @@ const localSerials = ref([]) // List of serial numbers for this item
 const removedSerials = ref([]) // Track serials removed during this edit session
 const originalSerials = ref([]) // Original serials when dialog opened
 const originalPriceListRate = ref(0) // Original price_list_rate when dialog opened (for rate edit validation)
+const offerPercent = ref(0) // What an offer already takes off this item; the user's limit applies on top
+
+// The user's discount limit (POS Role Rule, or POS Settings): null = any discount
+const discountLimit = computed(() => settingsStore.discountLimit)
+
+// The most the item discount may take off now, after any price change (the limit is a
+// percent of the original price, as the server checks it)
+const maxItemDiscount = computed(() =>
+	maxDiscountAmount({
+		originalTotal: originalPriceListRate.value * localQuantity.value,
+		subtotal: calculatedSubtotal.value,
+		limit: discountLimit.value,
+		offerPercent: offerPercent.value,
+	}),
+)
+// The highest percent that may be typed: the limit itself on the original price, less
+// what a price change already took off. The unit price is rounded up afterwards, so
+// typing the full limit never gives more than the limit (10% off 4.49 = 4.05).
+const maxDiscountPercentNow = computed(() => {
+	if (discountLimit.value === null || localRate.value <= 0) return 100
+	const allowed = Math.min(100, Math.max(0, discountLimit.value) + Math.max(0, offerPercent.value))
+	const lowestUnitPrice = originalPriceListRate.value * (1 - allowed / 100)
+	const percent = (1 - lowestUnitPrice / localRate.value) * 100
+	return Math.min(100, Math.max(0, Math.floor(percent * 100 + 1e-6) / 100))
+})
 
 const getItemDetailsResource = createResource({
 	url: "pos_next.api.items.get_item_details",
@@ -439,6 +470,17 @@ watch(
 			} else {
 				discountType.value = "percentage"
 				discountValue.value = 0
+			}
+
+			// An offer's discount is the system's, not the cashier's (as on the server)
+			offerPercent.value = 0
+			if (newItem.pricing_rules && newItem.pricing_rules.length > 0) {
+				const lineTotal = (newItem.rate || 0) * localQuantity.value
+				if (newItem.discount_percentage > 0) {
+					offerPercent.value = newItem.discount_percentage
+				} else if (newItem.discount_amount > 0 && lineTotal > 0) {
+					offerPercent.value = (newItem.discount_amount / lineTotal) * 100
+				}
 			}
 
 			// Reset stock check state
@@ -640,24 +682,44 @@ function handleDiscountTypeChange() {
 	calculateTotals()
 }
 
-function calculateDiscount() {
+// The line discount the cart will record: the discounted unit price is rounded UP to
+// the penny (as in useInvoice recalculateItem), so it is never more than entered.
+function discountForUnitPrice(perUnitDiscount) {
+	if (!(perUnitDiscount > 0)) return 0
+	const unitPrice = Math.max(0, ceilCurrency(localRate.value - perUnitDiscount))
+	return roundCurrency(calculatedSubtotal.value - roundCurrency(unitPrice * localQuantity.value))
+}
+
+function calculateDiscount(typed = false) {
 	// Round to currency precision to prevent floating point precision issues (e.g., 10.000000000000002)
 	if (discountValue.value !== null && discountValue.value !== undefined && !isNaN(discountValue.value)) {
 		discountValue.value = roundCurrency(discountValue.value)
 	}
+
+	// Cap at the user's limit as they type (a discount already on the item when the
+	// dialog opens is left as it is; Update checks it)
+	const capAtLimit = typed === true && discountLimit.value !== null
 
 	if (discountType.value === "percentage") {
 		// Ensure percentage doesn't exceed 100
 		if (discountValue.value > 100) {
 			discountValue.value = 100
 		}
-		calculatedDiscount.value = roundCurrency((calculatedSubtotal.value * discountValue.value) / 100)
+		if (capAtLimit && discountValue.value > maxDiscountPercentNow.value) {
+			discountValue.value = maxDiscountPercentNow.value
+			showWarning(__('Your limit is {0}%', [discountLimit.value]))
+		}
+		calculatedDiscount.value = discountForUnitPrice((localRate.value * discountValue.value) / 100)
 	} else {
 		// Ensure amount doesn't exceed subtotal
 		if (discountValue.value > calculatedSubtotal.value) {
 			discountValue.value = roundCurrency(calculatedSubtotal.value)
 		}
-		calculatedDiscount.value = roundCurrency(discountValue.value)
+		if (capAtLimit && discountValue.value > maxItemDiscount.value) {
+			discountValue.value = maxItemDiscount.value
+			showWarning(__('Your limit is {0}% ({1})', [discountLimit.value, formatCurrency(maxItemDiscount.value)]))
+		}
+		calculatedDiscount.value = discountForUnitPrice(localQuantity.value > 0 ? discountValue.value / localQuantity.value : 0)
 	}
 	calculatedTotal.value = roundCurrency(calculatedSubtotal.value - calculatedDiscount.value)
 }
@@ -698,22 +760,41 @@ function updateItem() {
 			return
 		}
 
-		// Validate against max discount if rate was reduced
-		const maxDiscount = settingsStore.maxDiscountAllowed
-		if (maxDiscount > 0 && localRate.value < originalPriceListRate.value) {
-			const discountPercent = ((originalPriceListRate.value - localRate.value) / originalPriceListRate.value) * 100
-			const roundedDiscount = Math.round(discountPercent * 100) / 100
-
-			if (roundedDiscount > maxDiscount) {
-				showError(
-					__('Rate reduction of {0}% exceeds maximum allowed discount of {1}%', [
-						roundedDiscount.toFixed(2),
-						maxDiscount
-					])
-				)
-				return
-			}
+		// Validate against the user's discount limit if rate was reduced (0 = no reduction)
+		const limit = discountLimit.value
+		if (
+			localRate.value < originalPriceListRate.value &&
+			!isWithinLimit({ originalTotal: originalPriceListRate.value, total: localRate.value, limit })
+		) {
+			showError(
+				__('Rate reduction of {0}% exceeds maximum allowed discount of {1}%', [
+					discountPercent(originalPriceListRate.value, localRate.value).toFixed(2),
+					limit
+				])
+			)
+			return
 		}
+	}
+
+	// The price change and the item discount together stay within the limit
+	const originalTotal = originalPriceListRate.value * localQuantity.value
+	if (
+		calculatedDiscount.value > 0 &&
+		!isWithinLimit({
+			originalTotal,
+			total: calculatedTotal.value,
+			limit: discountLimit.value,
+			offerPercent: offerPercent.value,
+		})
+	) {
+		showError(
+			__('Discount {0}% on {1} is above your limit of {2}%', [
+				discountPercent(originalTotal, calculatedTotal.value),
+				localItem.value?.item_name || localItem.value?.item_code,
+				discountLimit.value
+			])
+		)
+		return
 	}
 
 	const updatedItem = {

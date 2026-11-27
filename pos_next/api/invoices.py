@@ -26,6 +26,9 @@ FIELD_MAX_DISCOUNT_ALLOWED = "max_discount_allowed"
 FIELD_DISABLE_ROUNDED_TOTAL = "disable_rounded_total"
 FIELD_ALLOW_NEGATIVE_STOCK = "allow_negative_stock"
 
+# Sent by the till with a sale saved offline: the user who rang it up.
+RUNG_UP_BY_FIELD = "pos_next_rung_up_by"
+
 # Doctypes
 DOCTYPE_SALES_INVOICE = "Sales Invoice"
 DOCTYPE_POS_SETTINGS = "POS Settings"
@@ -81,14 +84,15 @@ def calculate_price_list_rate(item_rate, discount_pct, current_price_list_rate):
     return current_price_list_rate if current_price_list_rate else item_rate
 
 
-def validate_manual_rate_edit(item, pos_profile=None, pos_settings_cache=None):
+def validate_manual_rate_edit(item, pos_profile=None, rules=None):
     """
-    Validate manually edited item rates against POS Settings business rules.
+    Validate a manually edited item rate against the user's till powers.
 
     This function enforces:
     1. Rate must be positive
-    2. Rate editing must be enabled in POS Settings
-    3. Rate reduction must not exceed max_discount_allowed (if configured)
+    2. The user may change prices at the till (POS Role Rule "Price Change at the
+       Till", or POS Settings when no rule applies)
+    3. A price reduction stays within the user's discount limit
 
     Args:
         item: The item dict/object with rate information. Must contain:
@@ -96,13 +100,15 @@ def validate_manual_rate_edit(item, pos_profile=None, pos_settings_cache=None):
             - item_code: The item code for error messages
             - rate: The edited rate
             - original_rate or price_list_rate: The original catalog price
-        pos_profile: POS Profile name for settings lookup. Required for manual edits.
-        pos_settings_cache: Optional pre-fetched POS Settings dict to avoid repeated DB queries.
-            Should contain: allow_user_to_edit_rate, max_discount_allowed
+        pos_profile: POS Profile name. Required for manual edits.
+        rules: Optional pre-computed rules (pos_next.api.role_rules.get_effective_rules)
+            for the session user; worked out when not given.
 
     Returns:
         dict with 'valid' boolean and 'message' string if invalid
     """
+    from pos_next.api.role_rules import discount_limit, get_effective_rules
+
     is_manual_edit = cint(item.get(FIELD_IS_RATE_MANUALLY_EDITED) or 0)
 
     # Skip validation if not a manual edit
@@ -127,40 +133,29 @@ def validate_manual_rate_edit(item, pos_profile=None, pos_settings_cache=None):
             "message": _("POS Profile is required to validate rate edit for item {0}").format(item_code)
         }
 
-    # Use cached POS Settings if provided, otherwise fetch from DB
-    pos_settings = pos_settings_cache
-    if pos_settings is None:
-        pos_settings = frappe.db.get_value(
-            DOCTYPE_POS_SETTINGS,
-            {"pos_profile": pos_profile},
-            [FIELD_ALLOW_USER_TO_EDIT_RATE, FIELD_MAX_DISCOUNT_ALLOWED],
-            as_dict=True
-        )
-
-    # Check if POS Settings exists
-    if not pos_settings:
-        return {
-            "valid": False,
-            "message": _("POS Settings not found for profile {0}. Cannot validate rate edit.").format(pos_profile)
-        }
+    if rules is None:
+        rules = get_effective_rules(frappe.session.user, pos_profile)
 
     # Check if rate editing is allowed
-    if not cint(pos_settings.get(FIELD_ALLOW_USER_TO_EDIT_RATE)):
+    if not cint(rules.get("allow_rate_edit")):
         return {
             "valid": False,
-            "message": _("Rate editing is not allowed for this POS Profile")
+            "message": _("You are not allowed to change the price of {0} at the till.").format(item_code)
         }
 
-    # Validate against max discount if configured and rate is reduced
-    max_discount = flt(pos_settings.get(FIELD_MAX_DISCOUNT_ALLOWED) or 0)
-    if max_discount > 0 and original_rate > 0 and item_rate < original_rate:
-        # Calculate effective discount percentage
+    # A price reduction is a discount: it must stay within the user's limit. Compared in
+    # money, exactly (lowest allowed price rounded UP to the penny), as in discount_rules.
+    from pos_next.api.discount_rules import EPSILON, ceil_money
+
+    limit = discount_limit(rules)
+    if limit is not None and original_rate > 0 and item_rate < original_rate:
         discount_pct = round(((original_rate - item_rate) / original_rate) * 100, 2)
-        if discount_pct > max_discount:
+        lowest_price = ceil_money(original_rate * (1 - min(limit, 100.0) / 100), 2)
+        if item_rate < lowest_price - EPSILON:
             return {
                 "valid": False,
-                "message": _("Rate reduction for item {0} is {1}% which exceeds the maximum allowed discount of {2}%").format(
-                    item_code, discount_pct, max_discount
+                "message": _("Discount {0}% on {1} (price change) is above your limit of {2}%.").format(
+                    discount_pct, item_code, int(limit) if flt(limit).is_integer() else limit
                 )
             }
 
@@ -687,6 +682,8 @@ def update_invoice(data):
     try:
         data = json.loads(data) if isinstance(data, str) else data
         data = _strip_server_managed_fields(data)
+        # Who rang up a sale saved offline; only ever makes the till powers stricter.
+        rung_up_by = data.pop(RUNG_UP_BY_FIELD, None)
 
         pos_profile = data.get("pos_profile")
         doctype = data.get("doctype", "Sales Invoice")
@@ -708,6 +705,8 @@ def update_invoice(data):
         # read linked docs (e.g., Customer) and trigger controller permission checks.
         invoice_doc.flags.ignore_permissions = True
         frappe.flags.ignore_account_permission = True
+        if rung_up_by:
+            invoice_doc.flags.pos_next_rung_up_by = rung_up_by
 
         pos_profile_doc = None
         if pos_profile:
@@ -811,6 +810,7 @@ def update_invoice(data):
         # Formula: rate = price_list_rate * (1 - discount_percentage/100)
         # Reverse: price_list_rate = rate / (1 - discount_percentage/100)
         # ========================================================================
+        till_rules = None  # the user's till powers, worked out at the first manual edit
         for item in invoice_doc.get("items", []):
             item_rate = flt(item.rate or 0)
             discount_pct = flt(item.discount_percentage or 0)
@@ -823,8 +823,12 @@ def update_invoice(data):
                 if original_rate > 0:
                     item.price_list_rate = original_rate
 
-                # Validate manual rate edit against business rules (uses cached settings)
-                validation = validate_manual_rate_edit(item, pos_profile, pos_settings_cache)
+                # Validate manual rate edit against the user's till powers (POS Role Rule)
+                if till_rules is None and pos_profile:
+                    from pos_next.api.discount_rules import rules_for_invoice
+
+                    till_rules = rules_for_invoice(invoice_doc)
+                validation = validate_manual_rate_edit(item, pos_profile, till_rules)
                 if not validation.get("valid"):
                     frappe.throw(validation.get("message"))
             else:
@@ -1254,6 +1258,9 @@ def submit_invoice(invoice=None, data=None):
         data = {}
 
     invoice = _strip_server_managed_fields(invoice)
+    # Who rang up a sale saved offline (sent by the till). Only ever makes the till
+    # powers stricter (pos_next.api.discount_rules.rules_for_invoice).
+    rung_up_by = invoice.pop(RUNG_UP_BY_FIELD, None)
 
     pos_profile = invoice.get("pos_profile")
     doctype = invoice.get("doctype", "Sales Invoice")
@@ -1309,7 +1316,8 @@ def submit_invoice(invoice=None, data=None):
 
         # Get or create invoice
         if not invoice_name or not frappe.db.exists(doctype, invoice_name):
-            created = update_invoice(json.dumps(invoice))
+            draft_payload = dict(invoice, **{RUNG_UP_BY_FIELD: rung_up_by}) if rung_up_by else invoice
+            created = update_invoice(json.dumps(draft_payload))
             if not created or not isinstance(created, dict):
                 frappe.throw(_("Failed to create invoice draft"))
             invoice_name = created.get("name")
@@ -1319,6 +1327,8 @@ def submit_invoice(invoice=None, data=None):
         else:
             invoice_doc = frappe.get_doc(doctype, invoice_name)
             invoice_doc.update(invoice)
+        if rung_up_by:
+            invoice_doc.flags.pos_next_rung_up_by = rung_up_by
             
         # =========================
         # FORCE COST CENTER

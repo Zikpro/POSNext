@@ -70,4 +70,14 @@ DEFAULT_POS_SETTINGS = {
 	"enable_session_lock": 0,
 	"session_lock_timeout": 5,
 	"show_variants_as_items": 0,
+	# The user's till powers (pos_next.api.role_rules), added to the settings sent to
+	# the till. Not POS Settings columns, so they are not in POS_SETTINGS_FIELDS.
+	# These defaults match the POS Settings defaults above (0 = no discount limit).
+	"allow_any_discount": 1,
+	"max_discount_percent": 0,
+	"allow_item_discount": 1,
+	"allow_additional_discount": 0,
+	"allow_rate_edit": 0,
+	"allow_return_without_receipt": 0,
+	"allow_award_loyalty_points": 0,
 }
