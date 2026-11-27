@@ -474,6 +474,21 @@ class TestDirectAPICalls(RoleRulesTestCase):
 			self.submit(cashier, self.payload(85, 15))
 		self.assertEqual(frappe.db.count("Sales Invoice", {"customer": self.customer}), before)
 
+	def test_a_rounded_up_discount_is_saved_with_its_true_percent(self):
+		# 10% off 2.99 is charged 2.70 (the till rounds up). The invoice line must keep a
+		# percent that gives that price (9.70%), not lose it to 0 (ERPNext 16.60+).
+		cashier = make_user("pos-rule-cashier@example.com", ROLE_CASHIER)
+		make_rule(ROLE_CASHIER, max_discount_percent=10, allow_item_discount=1)
+		result = self.submit(cashier, self.payload(2.70, 10, price_list_rate=2.99))
+		row = frappe.get_all(
+			"Sales Invoice Item", filters={"parent": result["name"]},
+			fields=["price_list_rate", "rate", "discount_percentage", "discount_amount"],
+		)[0]
+		self.assertEqual(
+			(row.price_list_rate, row.rate, round(row.discount_percentage, 2), row.discount_amount),
+			(2.99, 2.70, 9.70, 0.29),
+		)
+
 	def test_discount_within_the_limit_is_submitted(self):
 		cashier = make_user("pos-rule-cashier@example.com", ROLE_CASHIER)
 		make_rule(ROLE_CASHIER, max_discount_percent=10, allow_item_discount=1)

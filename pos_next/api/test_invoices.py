@@ -164,3 +164,42 @@ class TestValidateManualRateEditForTheUser(RoleRulesTestCase):
 		make_rule(ROLE_MANAGER, allow_rate_edit=1, allow_any_discount=1)
 		make_pos_settings(TILL_A, allow_user_to_edit_rate=1, max_discount_allowed=10)
 		self.assertFalse(self.check_as(cashier, edit(85))["valid"])
+
+
+class TestAlignDiscountWithRate(RoleRulesTestCase):
+	"""_align_discount_with_rate: the discount fields describe the price actually charged,
+	so ERPNext (16.60+) keeps the percent instead of resetting it to 0."""
+
+	def row(self, price_list_rate, rate, discount_percentage=0, discount_amount=0):
+		return frappe.get_doc({
+			"doctype": "Sales Invoice Item", "item_code": "ITEM-1", "qty": 1,
+			"price_list_rate": price_list_rate, "rate": rate,
+			"discount_percentage": discount_percentage, "discount_amount": discount_amount,
+		})
+
+	def align(self, item):
+		from pos_next.api.invoices import _align_discount_with_rate
+
+		_align_discount_with_rate(item)
+		return round(item.discount_percentage, 2), round(item.discount_amount, 2)
+
+	def test_rounded_up_price_gets_its_true_percent(self):
+		# 10% off 2.99 is charged 2.70 (rounded up): the line says 9.70%, 0.29 off.
+		self.assertEqual(self.align(self.row(2.99, 2.70, 10)), (9.70, 0.29))
+
+	def test_the_percent_gives_back_the_same_price(self):
+		item = self.row(2.99, 2.70, 10)
+		self.align(item)
+		erpnext_price = round(item.price_list_rate - round(item.price_list_rate * item.discount_percentage / 100, 2), 2)
+		self.assertEqual(erpnext_price, 2.70)
+
+	def test_an_exact_percent_is_unchanged(self):
+		self.assertEqual(self.align(self.row(11.95, 9.56, 20)), (20.0, 2.39))
+
+	def test_a_discount_given_as_an_amount_gets_its_percent_too(self):
+		self.assertEqual(self.align(self.row(4.49, 4.05, 0, 0.44)), (9.80, 0.44))
+
+	def test_items_without_a_discount_are_left_alone(self):
+		self.assertEqual(self.align(self.row(2.99, 2.99)), (0, 0))  # full price
+		self.assertEqual(self.align(self.row(2.99, 3.20)), (0, 0))  # price raised, no discount
+		self.assertEqual(self.align(self.row(2.99, 0, 100)), (100, 0))  # free: not touched

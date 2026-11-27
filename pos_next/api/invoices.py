@@ -275,6 +275,42 @@ def _pricing_rule_to_string(value):
     return ""
 
 
+def _align_discount_with_rate(item):
+    """Set an item's discount percent and amount to the discount its rate really gives.
+
+    The till rounds a discounted price UP to the penny, so a discount is never more than
+    the one entered: 10% off 2.99 is charged 2.70, which is 9.70%. ERPNext (16.60 and
+    later) works out its own price from the percent (2.99 - 0.30 = 2.69) and, when that
+    differs from the rate sent, keeps the rate but resets the percent to 0. Sending the
+    true percent (9.70%, amount 0.29) gives the same price, so the invoice keeps it.
+
+    Only touches items sold below their price list rate with a discount given; the rate
+    itself is never changed. If the percent cannot be stored precisely enough to give the
+    same price, the item is left as it was.
+    """
+    price_list_rate = flt(item.get("price_list_rate"))
+    rate = flt(item.get("rate"))
+    has_discount = flt(item.get("discount_percentage")) > 0 or flt(item.get("discount_amount")) > 0
+    if price_list_rate <= 0 or rate <= 0 or rate >= price_list_rate or not has_discount:
+        return
+
+    rate_precision = cint(item.precision("rate"))
+    amount_precision = cint(item.precision("discount_amount"))
+    percent_precision = cint(item.precision("discount_percentage"))
+
+    discount_amount = flt(price_list_rate - rate, amount_precision)
+    discount_percentage = flt(discount_amount / price_list_rate * 100, percent_precision)
+    # The price ERPNext will work out from this percent must be the rate charged.
+    erpnext_price = flt(
+        price_list_rate - flt(price_list_rate * discount_percentage / 100, amount_precision), rate_precision
+    )
+    if erpnext_price != flt(rate, rate_precision):
+        return
+
+    item.discount_percentage = discount_percentage
+    item.discount_amount = discount_amount
+
+
 def _strip_server_managed_fields(payload):
     """Remove fields that are derived server-side and should not be replayed."""
     if not isinstance(payload, dict):
@@ -851,6 +887,9 @@ def update_invoice(data):
             # IMPORTANT: Keep the rate from frontend (do NOT set to 0)
             # ERPNext will recalculate if needed, but preserving frontend rate
             # prevents rounding issues and ensures UI matches invoice
+
+            # Make the discount fields describe the price actually charged (see the helper).
+            _align_discount_with_rate(item)
 
             # POS Next computes offers itself (via apply_offers) and sends each
             # item with discount_percentage / discount_amount / rate already set.
